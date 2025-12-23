@@ -31,32 +31,41 @@ def is_ready(report_obj: Dict[str, Any]) -> bool:
 
 
 def extract_items(page_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Reporting API responses commonly embed lists under _embedded.
+    Extract findings defensively.
+    """
     embedded = page_obj.get("_embedded") or {}
     if isinstance(embedded.get("findings"), list):
         return embedded["findings"]
+    # fallback: first list-of-dicts
     for v in embedded.values():
         if isinstance(v, list) and (not v or isinstance(v[0], dict)):
             return v
+    # fallback: direct
     if isinstance(page_obj.get("findings"), list):
         return page_obj["findings"]
     return []
 
 
-def post_generate_report(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, app_id: int, last_updated_start: str) -> Dict[str, Any]:
+def post_generate_report(
+    api_base: str,
+    auth: RequestsAuthPluginVeracodeHMAC,
+    app_id: int,
+    last_updated_start: str,
+) -> Dict[str, Any]:
     """
-    Reporting REST API: generate Findings report, scoped to one app.
-    Veracode indicates an `app_id` filter exists. We'll use it,
-    and still client-filter later as a safety net.  [oai_citation:2‡Veracode Docs](https://docs.veracode.com/r/About_Veracode_API_Best_Practices?utm_source=chatgpt.com)
+    Generate a Findings report and attempt to scope it to one app via filters.
+    Some tenants/versions may differ; we also client-filter later as a safety net.
     """
     url = f"{api_base}/appsec/v1/analytics/report"
 
     payload = {
         "report_type": "FINDINGS",
         "last_updated_start_date": last_updated_start,
-        # Attempt server-side filtering
         "filters": {
             "app_id": [app_id]
-        }
+        },
     }
 
     r = requests.post(url, json=payload, auth=auth, timeout=API_TIMEOUT_S)
@@ -65,7 +74,12 @@ def post_generate_report(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, ap
     return r.json()
 
 
-def get_report_page(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, report_id: str, page: int) -> Dict[str, Any]:
+def get_report_page(
+    api_base: str,
+    auth: RequestsAuthPluginVeracodeHMAC,
+    report_id: str,
+    page: int,
+) -> Dict[str, Any]:
     url = f"{api_base}/appsec/v1/analytics/report/{report_id}"
     r = requests.get(url, params={"page": page}, auth=auth, timeout=API_TIMEOUT_S)
     if r.status_code >= 400:
@@ -75,10 +89,9 @@ def get_report_page(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, report_
 
 def client_filter_by_app_id(items: List[Dict[str, Any]], app_id: int) -> List[Dict[str, Any]]:
     """
-    Safety net in case server-side filters differ by version/tenant.
-    Tries a few common fields.
+    Safety net: enforce app scope client-side in case server-side filter differs.
     """
-    keep = []
+    keep: List[Dict[str, Any]] = []
     for it in items:
         candidates = [
             it.get("app_id"),
@@ -96,9 +109,12 @@ def main() -> None:
     app_id = int(must_env("APP_ID"))
     last_updated_start = must_env("LAST_UPDATED_START_DATE")
 
-    auth = RequestsAuthPluginVeracodeHMAC()
+    # ✅ FIX: read creds from env (GitHub Secrets) and pass explicitly to auth plugin
+    api_id = must_env("VERACODE_API_ID")
+    api_key = must_env("VERACODE_API_KEY")
+    auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
 
-    # 1) Generate report (attempt scoped to app_id)
+    # 1) Generate report
     created = post_generate_report(api_base, auth, app_id, last_updated_start)
     write_json("out/report_create.json", created)
 
@@ -114,11 +130,13 @@ def main() -> None:
 
         if is_ready(page0):
             break
+
         if time.time() - start > MAX_POLL_S:
-            raise SystemExit("Timed out waiting for report readiness.")
+            raise SystemExit("Timed out waiting for report readiness (see out/report_page0_latest.json).")
+
         time.sleep(POLL_INTERVAL_S)
 
-    # 3) Paginate
+    # 3) Paginate pages until empty
     pages: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
 
@@ -136,7 +154,7 @@ def main() -> None:
 
     write_json("out/report_pages.json", pages)
 
-    # 4) Enforce single-app scope client-side (safety net)
+    # 4) Enforce single-app scope client-side
     filtered = client_filter_by_app_id(all_items, app_id)
     write_json(f"out/findings_{app_id}.json", filtered)
 
