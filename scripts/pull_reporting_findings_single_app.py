@@ -2,7 +2,7 @@
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
@@ -31,18 +31,12 @@ def is_ready(report_obj: Dict[str, Any]) -> bool:
 
 
 def extract_items(page_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Reporting API responses commonly embed lists under _embedded.
-    Extract findings defensively.
-    """
     embedded = page_obj.get("_embedded") or {}
     if isinstance(embedded.get("findings"), list):
         return embedded["findings"]
-    # fallback: first list-of-dicts
     for v in embedded.values():
         if isinstance(v, list) and (not v or isinstance(v[0], dict)):
             return v
-    # fallback: direct
     if isinstance(page_obj.get("findings"), list):
         return page_obj["findings"]
     return []
@@ -51,23 +45,17 @@ def extract_items(page_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
 def post_generate_report(
     api_base: str,
     auth: RequestsAuthPluginVeracodeHMAC,
-    app_id: int,
     last_updated_start: str,
 ) -> Dict[str, Any]:
     """
-    Generate a Findings report and attempt to scope it to one app via filters.
-    Some tenants/versions may differ; we also client-filter later as a safety net.
+    Generate a Findings report. This tenant rejects 'filters' for FINDINGS,
+    so we generate portfolio-wide and filter client-side by app_id.
     """
     url = f"{api_base}/appsec/v1/analytics/report"
-
     payload = {
         "report_type": "FINDINGS",
         "last_updated_start_date": last_updated_start,
-        "filters": {
-            "app_id": [app_id]
-        },
     }
-
     r = requests.post(url, json=payload, auth=auth, timeout=API_TIMEOUT_S)
     if r.status_code >= 400:
         raise SystemExit(f"POST {url} failed: {r.status_code}\n{r.text}")
@@ -87,21 +75,27 @@ def get_report_page(
     return r.json()
 
 
-def client_filter_by_app_id(items: List[Dict[str, Any]], app_id: int) -> List[Dict[str, Any]]:
+def infer_app_id(item: Dict[str, Any]) -> Optional[int]:
     """
-    Safety net: enforce app scope client-side in case server-side filter differs.
+    Try to locate an application id in a finding record.
+    The exact schema varies; we probe several common shapes.
     """
-    keep: List[Dict[str, Any]] = []
-    for it in items:
-        candidates = [
-            it.get("app_id"),
-            it.get("application_id"),
-            (it.get("application") or {}).get("id"),
-            (it.get("application") or {}).get("app_id"),
-        ]
-        if any(str(c) == str(app_id) for c in candidates if c is not None):
-            keep.append(it)
-    return keep
+    candidates = [
+        item.get("app_id"),
+        item.get("application_id"),
+        item.get("applicationId"),
+        (item.get("application") or {}).get("id"),
+        (item.get("application") or {}).get("app_id"),
+        (item.get("application") or {}).get("application_id"),
+    ]
+    for c in candidates:
+        if c is None:
+            continue
+        try:
+            return int(str(c))
+        except Exception:
+            pass
+    return None
 
 
 def main() -> None:
@@ -109,13 +103,13 @@ def main() -> None:
     app_id = int(must_env("APP_ID"))
     last_updated_start = must_env("LAST_UPDATED_START_DATE")
 
-    # ✅ FIX: read creds from env (GitHub Secrets) and pass explicitly to auth plugin
+    # Credentials from GitHub Secrets
     api_id = must_env("VERACODE_API_ID")
     api_key = must_env("VERACODE_API_KEY")
     auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
 
-    # 1) Generate report
-    created = post_generate_report(api_base, auth, app_id, last_updated_start)
+    # 1) Generate report (portfolio-wide)
+    created = post_generate_report(api_base, auth, last_updated_start)
     write_json("out/report_create.json", created)
 
     report_id = str(created.get("id") or "")
@@ -136,7 +130,7 @@ def main() -> None:
 
         time.sleep(POLL_INTERVAL_S)
 
-    # 3) Paginate pages until empty
+    # 3) Paginate all pages
     pages: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
 
@@ -153,15 +147,27 @@ def main() -> None:
         page += 1
 
     write_json("out/report_pages.json", pages)
+    write_json("out/findings_portfolio_flat.json", all_items)
 
-    # 4) Enforce single-app scope client-side
-    filtered = client_filter_by_app_id(all_items, app_id)
-    write_json(f"out/findings_{app_id}.json", filtered)
+    # 4) Filter to single app
+    only_app: List[Dict[str, Any]] = []
+    unknown_app: int = 0
+
+    for it in all_items:
+        found_app = infer_app_id(it)
+        if found_app is None:
+            unknown_app += 1
+            continue
+        if found_app == app_id:
+            only_app.append(it)
+
+    write_json(f"out/findings_{app_id}.json", only_app)
 
     print(f"report_id={report_id}")
     print(f"pages_fetched={len(pages)}")
     print(f"items_total={len(all_items)}")
-    print(f"items_after_app_filter={len(filtered)}")
+    print(f"unknown_app_id_items={unknown_app}")
+    print(f"items_for_app_{app_id}={len(only_app)}")
     print(f"wrote out/findings_{app_id}.json")
 
 
