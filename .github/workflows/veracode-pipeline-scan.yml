@@ -1,0 +1,23 @@
+name: Veracode Pipeline Scan (Juice Shop)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pipeline_scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source zip (exclude node_modules)
+        run: |
+          zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+
+      - name: Veracode Pipeline Scan
+        uses: veracode/Veracode-pipeline-scan-action@v1.0.12
+        with:
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          file: "juice-shop-src.zip"
