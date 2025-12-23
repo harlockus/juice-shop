@@ -16,12 +16,12 @@ jobs:
           zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
 
       - name: Veracode Upload & Scan (Policy Scan)
-        uses: veracode/veracode-uploadandscan-action@v1.0.6
+        uses: veracode/veracode-uploadandscan-action@0.2.11
         with:
           vid: ${{ secrets.VERACODE_API_ID }}
           vkey: ${{ secrets.VERACODE_API_KEY }}
           appname: "Juice-Shop-GitHub-Demo"
-          createprofile: true
+          createprofile: false
           filepath: "juice-shop-src.zip"
           scanallnonfataltoplevelmodules: true
-          deleteincompletescan: true
+          deleteincompletescan: 1
