@@ -1,0 +1,27 @@
+name: Veracode Policy Scan (Juice Shop)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  policy_scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source zip (exclude node_modules)
+        run: |
+          zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+
+      - name: Veracode Upload & Scan (Policy Scan)
+        uses: veracode/veracode-uploadandscan-action@v1.0.6
+        with:
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          appname: "Juice-Shop-GitHub-Demo"
+          createprofile: true
+          filepath: "juice-shop-src.zip"
+          scanallnonfataltoplevelmodules: true
+          deleteincompletescan: true
