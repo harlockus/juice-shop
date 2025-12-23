@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -42,44 +43,7 @@ def extract_items(page_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     return []
 
 
-def post_generate_report(
-    api_base: str,
-    auth: RequestsAuthPluginVeracodeHMAC,
-    last_updated_start: str,
-) -> Dict[str, Any]:
-    """
-    Generate a Findings report. This tenant rejects 'filters' for FINDINGS,
-    so we generate portfolio-wide and filter client-side by app_id.
-    """
-    url = f"{api_base}/appsec/v1/analytics/report"
-    payload = {
-        "report_type": "FINDINGS",
-        "last_updated_start_date": last_updated_start,
-    }
-    r = requests.post(url, json=payload, auth=auth, timeout=API_TIMEOUT_S)
-    if r.status_code >= 400:
-        raise SystemExit(f"POST {url} failed: {r.status_code}\n{r.text}")
-    return r.json()
-
-
-def get_report_page(
-    api_base: str,
-    auth: RequestsAuthPluginVeracodeHMAC,
-    report_id: str,
-    page: int,
-) -> Dict[str, Any]:
-    url = f"{api_base}/appsec/v1/analytics/report/{report_id}"
-    r = requests.get(url, params={"page": page}, auth=auth, timeout=API_TIMEOUT_S)
-    if r.status_code >= 400:
-        raise SystemExit(f"GET {url}?page={page} failed: {r.status_code}\n{r.text}")
-    return r.json()
-
-
 def infer_app_id(item: Dict[str, Any]) -> Optional[int]:
-    """
-    Try to locate an application id in a finding record.
-    The exact schema varies; we probe several common shapes.
-    """
     candidates = [
         item.get("app_id"),
         item.get("application_id"),
@@ -98,25 +62,89 @@ def infer_app_id(item: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def validate_date_yyyy_mm_dd(s: str) -> None:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        raise SystemExit("LAST_UPDATED_START_DATE must be YYYY-MM-DD (date only), e.g. 2025-12-01")
+
+
+def extract_report_id(created: Dict[str, Any]) -> Optional[str]:
+    # 1) Most common
+    if isinstance(created.get("id"), str) and created["id"]:
+        return created["id"]
+
+    # 2) Sometimes nested
+    embedded = created.get("_embedded") or {}
+    if isinstance(embedded, dict):
+        # try any dict in embedded that has an id
+        for v in embedded.values():
+            if isinstance(v, dict) and isinstance(v.get("id"), str) and v["id"]:
+                return v["id"]
+
+    # 3) Sometimes returned as a link href containing the id at the end
+    links = created.get("_links") or {}
+    if isinstance(links, dict):
+        for k in ("self", "report", "result"):
+            href = ((links.get(k) or {}).get("href") if isinstance(links.get(k), dict) else None)
+            if isinstance(href, str):
+                m = re.search(r"/appsec/v1/analytics/report/([0-9a-fA-F-]{36})", href)
+                if m:
+                    return m.group(1)
+
+    return None
+
+
+def post_generate_report(
+    api_base: str,
+    auth: RequestsAuthPluginVeracodeHMAC,
+    last_updated_start: str,
+) -> Dict[str, Any]:
+    url = f"{api_base}/appsec/v1/analytics/report"
+    payload = {
+        "report_type": "FINDINGS",
+        "last_updated_start_date": last_updated_start,  # must be YYYY-MM-DD per your tenant error
+    }
+    r = requests.post(url, json=payload, auth=auth, timeout=API_TIMEOUT_S)
+    # Even if not 2xx, capture body for debugging
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text}
+
+    if r.status_code >= 400:
+        write_json("out/report_create.json", body)
+        raise SystemExit(f"POST {url} failed: {r.status_code}\n{r.text}")
+
+    return body
+
+
+def get_report_page(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, report_id: str, page: int) -> Dict[str, Any]:
+    url = f"{api_base}/appsec/v1/analytics/report/{report_id}"
+    r = requests.get(url, params={"page": page}, auth=auth, timeout=API_TIMEOUT_S)
+    if r.status_code >= 400:
+        raise SystemExit(f"GET {url}?page={page} failed: {r.status_code}\n{r.text}")
+    return r.json()
+
+
 def main() -> None:
     api_base = must_env("VERACODE_API_BASE").rstrip("/")
     app_id = int(must_env("APP_ID"))
     last_updated_start = must_env("LAST_UPDATED_START_DATE")
+    validate_date_yyyy_mm_dd(last_updated_start)
 
-    # Credentials from GitHub Secrets
     api_id = must_env("VERACODE_API_ID")
     api_key = must_env("VERACODE_API_KEY")
     auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
 
-    # 1) Generate report (portfolio-wide)
+    # 1) Generate report
     created = post_generate_report(api_base, auth, last_updated_start)
     write_json("out/report_create.json", created)
 
-    report_id = str(created.get("id") or "")
+    report_id = extract_report_id(created)
     if not report_id:
+        # Leave report_create.json for inspection (uploaded via if: always()).
         raise SystemExit("No report id returned (see out/report_create.json).")
 
-    # 2) Poll until ready (page 0)
+    # 2) Poll until ready
     start = time.time()
     while True:
         page0 = get_report_page(api_base, auth, report_id, page=0)
@@ -130,7 +158,7 @@ def main() -> None:
 
         time.sleep(POLL_INTERVAL_S)
 
-    # 3) Paginate all pages
+    # 3) Paginate
     pages: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
 
@@ -149,16 +177,15 @@ def main() -> None:
     write_json("out/report_pages.json", pages)
     write_json("out/findings_portfolio_flat.json", all_items)
 
-    # 4) Filter to single app
+    # 4) Filter to single app client-side
     only_app: List[Dict[str, Any]] = []
-    unknown_app: int = 0
-
+    unknown = 0
     for it in all_items:
-        found_app = infer_app_id(it)
-        if found_app is None:
-            unknown_app += 1
+        aid = infer_app_id(it)
+        if aid is None:
+            unknown += 1
             continue
-        if found_app == app_id:
+        if aid == app_id:
             only_app.append(it)
 
     write_json(f"out/findings_{app_id}.json", only_app)
@@ -166,7 +193,7 @@ def main() -> None:
     print(f"report_id={report_id}")
     print(f"pages_fetched={len(pages)}")
     print(f"items_total={len(all_items)}")
-    print(f"unknown_app_id_items={unknown_app}")
+    print(f"unknown_app_id_items={unknown}")
     print(f"items_for_app_{app_id}={len(only_app)}")
     print(f"wrote out/findings_{app_id}.json")
 
