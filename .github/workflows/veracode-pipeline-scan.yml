@@ -3,10 +3,13 @@ name: Veracode Pipeline Scan (Juice Shop)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   pipeline_scan:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,9 +18,33 @@ jobs:
         run: |
           zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
 
-      - name: Veracode Pipeline Scan
-        uses: veracode/Veracode-pipeline-scan-action@v1.0.12
+      - name: Set up Java
+        uses: actions/setup-java@v4
         with:
-          vid: ${{ secrets.VERACODE_API_ID }}
-          vkey: ${{ secrets.VERACODE_API_KEY }}
-          file: "juice-shop-src.zip"
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Pipeline Scan tool
+        run: |
+          curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o pipeline-scan-LATEST.zip
+
+      - name: Run Pipeline Scan
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          java -jar pipeline-scan.jar \
+            --veracode_api_id "${VERACODE_API_ID}" \
+            --veracode_api_key "${VERACODE_API_KEY}" \
+            --file "juice-shop-src.zip" \
+            --json_output_file "results.json" \
+            --filtered_json_output_file "filtered_results.json"
+
+      - name: Upload results (safe artifact name)
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-pipeline-scan-results
+          path: |
+            results.json
+            filtered_results.json
