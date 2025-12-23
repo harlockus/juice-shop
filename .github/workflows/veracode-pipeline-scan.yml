@@ -51,6 +51,15 @@ jobs:
           import json
           from collections import Counter
 
+          SEVERITY_MAP = {
+              "5": "VERY_HIGH",  # Policy Scan / Reporting API only
+              "4": "HIGH",
+              "3": "MEDIUM",
+              "2": "LOW",
+              "1": "VERY_LOW",
+              "0": "INFO"
+          }
+
           try:
               with open("results.json", "r", encoding="utf-8") as f:
                   data = json.load(f)
@@ -58,7 +67,6 @@ jobs:
               print("Could not read results.json:", e)
               raise SystemExit(0)
 
-          # Defensive extraction (schema can vary slightly)
           findings = (
               data.get("findings")
               or data.get("issues")
@@ -70,20 +78,23 @@ jobs:
               print("No findings array detected.")
               raise SystemExit(0)
 
-          sev = Counter()
+          counts = Counter()
+
           for f in findings:
-              s = (
+              raw = str(
                   f.get("severity")
                   or f.get("severity_level")
-                  or f.get("severityName")
+                  or f.get("severityCode")
                   or "UNKNOWN"
               )
-              sev[str(s).upper()] += 1
+              sev = SEVERITY_MAP.get(raw, raw)
+              counts[sev] += 1
 
           print("\n=== Veracode Pipeline Scan Summary ===")
-          for k, v in sev.most_common():
-              print(f"{k}: {v}")
-          print(f"TOTAL ISSUES: {sum(sev.values())}")
+          for sev in ["HIGH", "MEDIUM", "LOW", "VERY_LOW", "INFO"]:
+              if counts.get(sev):
+                  print(f"{sev}: {counts[sev]}")
+          print(f"TOTAL ISSUES: {sum(counts.values())}")
           print("====================================\n")
           PY
 
