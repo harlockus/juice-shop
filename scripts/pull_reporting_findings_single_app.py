@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
@@ -73,10 +73,6 @@ def infer_app_id(item: Dict[str, Any]) -> Optional[int]:
 
 
 def extract_report_id(created: Dict[str, Any]) -> Optional[str]:
-    """
-    Your tenant returns the report ID here:
-      created["_embedded"]["id"]
-    """
     embedded = created.get("_embedded")
     if isinstance(embedded, dict):
         rid = embedded.get("id")
@@ -109,6 +105,22 @@ def post_generate_report(
     return body
 
 
+def parse_valid_page_range(err_json: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """
+    Looks for:
+      "Valid page numbers are : [0 - 16]."
+    Returns (0, 16) if found.
+    """
+    try:
+        detail = err_json["_embedded"]["error"]["detail"]
+    except Exception:
+        return None
+    m = re.search(r"Valid page numbers are\s*:\s*\[(\d+)\s*-\s*(\d+)\]", str(detail))
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
 def get_report_page(
     api_base: str,
     auth: RequestsAuthPluginVeracodeHMAC,
@@ -117,8 +129,22 @@ def get_report_page(
 ) -> Dict[str, Any]:
     url = f"{api_base}/appsec/v1/analytics/report/{report_id}"
     r = requests.get(url, params={"page": page}, auth=auth, timeout=API_TIMEOUT_S)
+
     if r.status_code >= 400:
-        raise SystemExit(f"GET {url}?page={page} failed: {r.status_code}\n{r.text}")
+        # Try to parse the structured error (and stop paging if it's just "page out of range")
+        try:
+            err = r.json()
+        except Exception:
+            raise SystemExit(f"GET {url}?page={page} failed: {r.status_code}\n{r.text}")
+
+        rng = parse_valid_page_range(err)
+        if r.status_code == 400 and rng is not None:
+            lo, hi = rng
+            # Raise a special exception-like signal using SystemExit with a recognizable message
+            raise RuntimeError(f"PAGE_OUT_OF_RANGE:{lo}:{hi}:{page}")
+
+        raise SystemExit(f"GET {url}?page={page} failed: {r.status_code}\n{json.dumps(err)}")
+
     return r.json()
 
 
@@ -130,10 +156,7 @@ def main() -> None:
 
     api_id = must_env("VERACODE_API_ID")
     api_key = must_env("VERACODE_API_KEY")
-    auth = RequestsAuthPluginVeracodeHMAC(
-        api_key_id=api_id,
-        api_key_secret=api_key,
-    )
+    auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
 
     # 1) Generate report
     created = post_generate_report(api_base, auth, last_updated_start)
@@ -157,13 +180,25 @@ def main() -> None:
 
         time.sleep(POLL_INTERVAL_S)
 
-    # 3) Paginate all pages
+    # 3) Paginate pages until empty OR until API tells us max page
     pages: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
 
     page = 0
+    max_page_seen: Optional[int] = None
+
     while True:
-        obj = get_report_page(api_base, auth, report_id, page=page)
+        try:
+            obj = get_report_page(api_base, auth, report_id, page=page)
+        except RuntimeError as e:
+            msg = str(e)
+            if msg.startswith("PAGE_OUT_OF_RANGE:"):
+                _, lo, hi, requested = msg.split(":")
+                max_page_seen = int(hi)
+                print(f"Reached end of pages. Server says valid pages are [{lo} - {hi}]. Stopping at page={requested}.")
+                break
+            raise
+
         pages.append(obj)
 
         items = extract_items(obj)
@@ -191,7 +226,7 @@ def main() -> None:
     write_json(f"out/findings_{app_id}.json", only_app)
 
     print(f"report_id={report_id}")
-    print(f"pages_fetched={len(pages)}")
+    print(f"pages_fetched={len(pages)}" + (f" (max_page={max_page_seen})" if max_page_seen is not None else ""))
     print(f"items_total={len(all_items)}")
     print(f"unknown_app_id_items={unknown}")
     print(f"items_for_app_{app_id}={len(only_app)}")
