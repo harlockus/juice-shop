@@ -1,0 +1,50 @@
+name: Veracode Reporting API - Pull Findings (Single App)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_id:
+        description: "Veracode application ID (e.g., 2864467)"
+        required: true
+        default: "2864467"
+      last_updated_start_date:
+        description: "Incremental start date (ISO-8601), e.g. 2025-12-01T00:00:00Z"
+        required: true
+        default: "2025-12-01T00:00:00Z"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  pull_findings_single_app:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests veracode-api-signing
+
+      - name: Pull findings for ONE app (generate, poll, paginate)
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+          VERACODE_API_BASE: ${{ secrets.VERACODE_API_BASE }}
+          APP_ID: ${{ inputs.app_id }}
+          LAST_UPDATED_START_DATE: ${{ inputs.last_updated_start_date }}
+        run: |
+          python scripts/pull_reporting_findings_single_app.py
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-reporting-findings-single-app
+          path: out/
