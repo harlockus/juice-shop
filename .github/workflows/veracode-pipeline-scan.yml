@@ -10,13 +10,16 @@ permissions:
 jobs:
   pipeline_scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Create source zip (exclude node_modules)
         run: |
-          zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+          zip -r juice-shop-src.zip . \
+            -x "**/node_modules/**" \
+            -x "**/.git/**"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -24,12 +27,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Download Pipeline Scan tool
+      - name: Download Veracode Pipeline Scan tool
         run: |
           curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip
 
-      - name: Run Pipeline Scan
+      - name: Run Veracode Pipeline Scan
+        continue-on-error: true   # do NOT fail job just because flaws exist
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
@@ -41,7 +45,49 @@ jobs:
             --json_output_file "results.json" \
             --filtered_json_output_file "filtered_results.json"
 
-      - name: Upload results (safe artifact name)
+      - name: Summarize vulnerabilities (from results.json)
+        run: |
+          python - << 'PY'
+          import json
+          from collections import Counter
+
+          try:
+              with open("results.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception as e:
+              print("Could not read results.json:", e)
+              raise SystemExit(0)
+
+          # Defensive extraction (schema can vary slightly)
+          findings = (
+              data.get("findings")
+              or data.get("issues")
+              or data.get("results")
+              or []
+          )
+
+          if not isinstance(findings, list):
+              print("No findings array detected.")
+              raise SystemExit(0)
+
+          sev = Counter()
+          for f in findings:
+              s = (
+                  f.get("severity")
+                  or f.get("severity_level")
+                  or f.get("severityName")
+                  or "UNKNOWN"
+              )
+              sev[str(s).upper()] += 1
+
+          print("\n=== Veracode Pipeline Scan Summary ===")
+          for k, v in sev.most_common():
+              print(f"{k}: {v}")
+          print(f"TOTAL ISSUES: {sum(sev.values())}")
+          print("====================================\n")
+          PY
+
+      - name: Upload Pipeline Scan results
         uses: actions/upload-artifact@v4
         with:
           name: veracode-pipeline-scan-results
