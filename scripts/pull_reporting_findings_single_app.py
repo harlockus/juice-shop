@@ -20,6 +20,11 @@ def must_env(name: str) -> str:
     return v
 
 
+def validate_date_yyyy_mm_dd(s: str) -> None:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        raise SystemExit("LAST_UPDATED_START_DATE must be YYYY-MM-DD (date only), e.g. 2025-12-01")
+
+
 def write_json(path: str, obj: Any) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -27,7 +32,12 @@ def write_json(path: str, obj: Any) -> None:
 
 
 def is_ready(report_obj: Dict[str, Any]) -> bool:
-    status = str(report_obj.get("status") or report_obj.get("state") or "").upper()
+    status = str(
+        report_obj.get("status")
+        or report_obj.get("state")
+        or report_obj.get("_embedded", {}).get("status")
+        or ""
+    ).upper()
     return status in {"COMPLETED", "COMPLETE", "READY", "FINISHED"}
 
 
@@ -62,34 +72,16 @@ def infer_app_id(item: Dict[str, Any]) -> Optional[int]:
     return None
 
 
-def validate_date_yyyy_mm_dd(s: str) -> None:
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        raise SystemExit("LAST_UPDATED_START_DATE must be YYYY-MM-DD (date only), e.g. 2025-12-01")
-
-
 def extract_report_id(created: Dict[str, Any]) -> Optional[str]:
-    # 1) Most common
-    if isinstance(created.get("id"), str) and created["id"]:
-        return created["id"]
-
-    # 2) Sometimes nested
-    embedded = created.get("_embedded") or {}
+    """
+    Your tenant returns the report ID here:
+      created["_embedded"]["id"]
+    """
+    embedded = created.get("_embedded")
     if isinstance(embedded, dict):
-        # try any dict in embedded that has an id
-        for v in embedded.values():
-            if isinstance(v, dict) and isinstance(v.get("id"), str) and v["id"]:
-                return v["id"]
-
-    # 3) Sometimes returned as a link href containing the id at the end
-    links = created.get("_links") or {}
-    if isinstance(links, dict):
-        for k in ("self", "report", "result"):
-            href = ((links.get(k) or {}).get("href") if isinstance(links.get(k), dict) else None)
-            if isinstance(href, str):
-                m = re.search(r"/appsec/v1/analytics/report/([0-9a-fA-F-]{36})", href)
-                if m:
-                    return m.group(1)
-
+        rid = embedded.get("id")
+        if isinstance(rid, str) and rid:
+            return rid
     return None
 
 
@@ -101,10 +93,10 @@ def post_generate_report(
     url = f"{api_base}/appsec/v1/analytics/report"
     payload = {
         "report_type": "FINDINGS",
-        "last_updated_start_date": last_updated_start,  # must be YYYY-MM-DD per your tenant error
+        "last_updated_start_date": last_updated_start,
     }
     r = requests.post(url, json=payload, auth=auth, timeout=API_TIMEOUT_S)
-    # Even if not 2xx, capture body for debugging
+
     try:
         body = r.json()
     except Exception:
@@ -117,7 +109,12 @@ def post_generate_report(
     return body
 
 
-def get_report_page(api_base: str, auth: RequestsAuthPluginVeracodeHMAC, report_id: str, page: int) -> Dict[str, Any]:
+def get_report_page(
+    api_base: str,
+    auth: RequestsAuthPluginVeracodeHMAC,
+    report_id: str,
+    page: int,
+) -> Dict[str, Any]:
     url = f"{api_base}/appsec/v1/analytics/report/{report_id}"
     r = requests.get(url, params={"page": page}, auth=auth, timeout=API_TIMEOUT_S)
     if r.status_code >= 400:
@@ -133,7 +130,10 @@ def main() -> None:
 
     api_id = must_env("VERACODE_API_ID")
     api_key = must_env("VERACODE_API_KEY")
-    auth = RequestsAuthPluginVeracodeHMAC(api_key_id=api_id, api_key_secret=api_key)
+    auth = RequestsAuthPluginVeracodeHMAC(
+        api_key_id=api_id,
+        api_key_secret=api_key,
+    )
 
     # 1) Generate report
     created = post_generate_report(api_base, auth, last_updated_start)
@@ -141,7 +141,6 @@ def main() -> None:
 
     report_id = extract_report_id(created)
     if not report_id:
-        # Leave report_create.json for inspection (uploaded via if: always()).
         raise SystemExit("No report id returned (see out/report_create.json).")
 
     # 2) Poll until ready
@@ -154,11 +153,11 @@ def main() -> None:
             break
 
         if time.time() - start > MAX_POLL_S:
-            raise SystemExit("Timed out waiting for report readiness (see out/report_page0_latest.json).")
+            raise SystemExit("Timed out waiting for report readiness.")
 
         time.sleep(POLL_INTERVAL_S)
 
-    # 3) Paginate
+    # 3) Paginate all pages
     pages: List[Dict[str, Any]] = []
     all_items: List[Dict[str, Any]] = []
 
@@ -177,9 +176,10 @@ def main() -> None:
     write_json("out/report_pages.json", pages)
     write_json("out/findings_portfolio_flat.json", all_items)
 
-    # 4) Filter to single app client-side
+    # 4) Filter to your application
     only_app: List[Dict[str, Any]] = []
     unknown = 0
+
     for it in all_items:
         aid = infer_app_id(it)
         if aid is None:
