@@ -1,0 +1,132 @@
+name: Veracode Findings Diff (A/B/C/D)
+
+on:
+  workflow_dispatch:
+    inputs:
+      application_name:
+        description: "Veracode application profile name (exact match)"
+        required: true
+        default: "Juice-Shop-GitHub-Demo"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  findings_diff:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Download the *latest* artifact from your "reporting pull" workflow run history
+      - name: Download previous findings artifact (if exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          WORKFLOW_FILE: veracode-reporting-pull-single-app.yml
+        run: |
+          set -euo pipefail
+          mkdir -p prev_artifact
+
+          # List workflow runs (success only), newest first
+          RUNS_JSON="$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?status=success&per_page=10")"
+
+          # Pick the most recent run that is NOT this run (in case you trigger diff right after pull)
+          PREV_RUN_ID="$(echo "$RUNS_JSON" | jq -r --arg cur "${GITHUB_RUN_ID}" '
+            .workflow_runs
+            | map(select((.id|tostring) != $cur))
+            | .[0].id // empty
+          ')"
+
+          if [ -z "${PREV_RUN_ID}" ]; then
+            echo "No previous successful run found. First-run scenario."
+            echo "PREV_FOUND=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          ART_JSON="$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${PREV_RUN_ID}/artifacts")"
+
+          # Artifact name from your reporting workflow is: veracode-reporting-findings-single-app
+          ART_ID="$(echo "$ART_JSON" | jq -r '
+            .artifacts
+            | map(select(.name=="veracode-reporting-findings-single-app"))
+            | .[0].id // empty
+          ')"
+
+          if [ -z "${ART_ID}" ]; then
+            echo "Previous run found but artifact not found."
+            echo "PREV_FOUND=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          echo "Downloading artifact id=${ART_ID} from run id=${PREV_RUN_ID}"
+          curl -L -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/actions/artifacts/${ART_ID}/zip" \
+            -o prev_artifact/prev.zip
+
+          unzip -o prev_artifact/prev.zip -d prev_artifact/unzipped >/dev/null
+          echo "PREV_FOUND=1" >> $GITHUB_ENV
+
+      - name: Locate current and previous findings JSON
+        env:
+          APP_NAME: ${{ inputs.application_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/diff
+
+          CUR="out/findings_single_app_${APP_NAME}.json"
+          if [ ! -f "$CUR" ]; then
+            echo "Current file not found: $CUR"
+            echo "Make sure you run veracode-reporting-pull-single-app.yml first."
+            exit 1
+          fi
+
+          echo "CUR_FILE=$CUR" >> $GITHUB_ENV
+
+          if [ "${PREV_FOUND:-0}" = "1" ]; then
+            PREV="prev_artifact/unzipped/out/findings_single_app_${APP_NAME}.json"
+            if [ -f "$PREV" ]; then
+              echo "PREV_FILE=$PREV" >> $GITHUB_ENV
+            else
+              echo "PREV_FOUND=0" >> $GITHUB_ENV
+              echo "Previous artifact exists but did not contain expected file: $PREV"
+            fi
+          fi
+
+      - name: Run findings diff (A/B/C/D)
+        env:
+          APP_NAME: ${{ inputs.application_name }}
+        run: |
+          python scripts/diff_reporting_findings.py \
+            --app-name "${APP_NAME}" \
+            --current "${CUR_FILE}" \
+            ${PREV_FOUND:+$( [ "${PREV_FOUND}" = "1" ] && echo "--previous ${PREV_FILE}" )} \
+            --out-dir "out/diff"
+
+      - name: Upload diff outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-findings-diff
+          path: out/diff/
