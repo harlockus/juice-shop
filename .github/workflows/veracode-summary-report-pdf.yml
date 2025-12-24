@@ -1,0 +1,51 @@
+name: Veracode Summary Report API (JSON + PDF)
+
+on:
+  workflow_dispatch:
+    inputs:
+      application_name:
+        description: "Veracode application profile name (exact match)"
+        required: true
+        default: "Juice-Shop-GitHub-Demo"
+      sandbox_guid:
+        description: "Optional: sandbox GUID for ?context= (leave blank for prod context)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  summary_report_pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests veracode-api-signing reportlab
+
+      - name: Generate Summary Report JSON + PDF
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+          VERACODE_API_BASE: ${{ secrets.VERACODE_API_BASE }}
+          APPLICATION_NAME: ${{ inputs.application_name }}
+          SANDBOX_GUID: ${{ inputs.sandbox_guid }}
+        run: |
+          python scripts/pull_summary_report_and_make_pdf.py
+
+      - name: Upload output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-summary-report
+          path: out/
