@@ -41,7 +41,7 @@ jobs:
           APPLICATION_NAME: ${{ inputs.application_name }}
           LAST_UPDATED_START_DATE: ${{ inputs.last_updated_start_date }}
         run: |
-          python scripts/veracode_reporting_findings_single_app.py
+          python scripts/pull_reporting_findings_single_app.py
 
       - name: Upload output
         if: always()
