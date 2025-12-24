@@ -1,14 +1,14 @@
-name: Veracode Reporting API - Pull Findings (Single App)
+name: Veracode Reporting API - Findings (Single App)
 
 on:
   workflow_dispatch:
     inputs:
-      app_id:
-        description: "Veracode application ID (e.g., 2864467)"
+      application_name:
+        description: "Veracode application profile name (exact match)"
         required: true
-        default: "2864467"
+        default: "Juice-Shop-GitHub-Demo"
       last_updated_start_date:
-        description: "Start date (YYYY-MM-DD), e.g. 2025-12-01"
+        description: "Start date (YYYY-MM-DD). Use an earlier date for first run."
         required: true
         default: "2025-12-01"
 
@@ -33,15 +33,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests veracode-api-signing
 
-      - name: Pull findings for ONE app (generate, poll, paginate)
+      - name: Pull Findings via Reporting API (resolve app IDs, generate, poll, paginate, filter)
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
           VERACODE_API_BASE: ${{ secrets.VERACODE_API_BASE }}
-          APP_ID: ${{ inputs.app_id }}
+          APPLICATION_NAME: ${{ inputs.application_name }}
           LAST_UPDATED_START_DATE: ${{ inputs.last_updated_start_date }}
         run: |
-          python scripts/pull_reporting_findings_single_app.py
+          python scripts/veracode_reporting_findings_single_app.py
 
       - name: Upload output
         if: always()
