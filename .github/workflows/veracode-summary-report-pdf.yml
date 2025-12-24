@@ -1,4 +1,4 @@
-name: Veracode Summary Report API (JSON + PDF)
+name: Veracode Summary Report API (JSON + PDF, supports SANDBOX_NAME)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ on:
         description: "Veracode application profile name (exact match)"
         required: true
         default: "Juice-Shop-GitHub-Demo"
-      sandbox_guid:
-        description: "Optional: sandbox GUID for ?context= (leave blank for prod context)"
+      sandbox_name:
+        description: "Optional: sandbox name (exact match). Leave blank for policy/prod context."
         required: false
         default: ""
 
@@ -39,7 +39,7 @@ jobs:
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
           VERACODE_API_BASE: ${{ secrets.VERACODE_API_BASE }}
           APPLICATION_NAME: ${{ inputs.application_name }}
-          SANDBOX_GUID: ${{ inputs.sandbox_guid }}
+          SANDBOX_NAME: ${{ inputs.sandbox_name }}
         run: |
           python scripts/pull_summary_report_and_make_pdf.py
 
