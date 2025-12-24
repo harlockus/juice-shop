@@ -39,8 +39,6 @@ jobs:
           set -euo pipefail
 
           mkdir -p cur_artifact prev_artifact out/diff
-
-          # IMPORTANT: initialize local var for strict mode
           BASELINE_ONLY=0
 
           RUNS_JSON="$(curl -sS \
@@ -106,25 +104,26 @@ jobs:
             fi
           fi
 
-          # Export for later steps
           echo "BASELINE_ONLY=${BASELINE_ONLY}" >> $GITHUB_ENV
 
-      - name: Set CUR/PREV file paths and run diff
+      - name: Find JSON files in artifacts and run diff
         env:
           APP_NAME: ${{ inputs.application_name }}
         run: |
           set -euo pipefail
           mkdir -p out/diff
-
-          # Safe default in case env not set for any reason
           BASELINE_ONLY="${BASELINE_ONLY:-0}"
 
-          CUR="cur_artifact/unzipped/out/findings_single_app_${APP_NAME}.json"
-          if [ ! -f "$CUR" ]; then
-            echo "Current findings not found in latest artifact: $CUR"
-            echo "Check that the reporting workflow produces out/findings_single_app_${APP_NAME}.json"
+          CUR="$(find cur_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}.json" | head -n 1 || true)"
+          if [ -z "$CUR" ]; then
+            echo "Current findings not found in latest artifact."
+            echo "Debug: listing findings_single_app_*.json under cur_artifact/unzipped:"
+            find cur_artifact/unzipped -maxdepth 6 -type f -name "findings_single_app_*.json" -print || true
+            echo "Debug: listing first 50 json files under cur_artifact/unzipped:"
+            find cur_artifact/unzipped -maxdepth 6 -type f -name "*.json" -print | head -n 50 || true
             exit 1
           fi
+          echo "Using CUR=$CUR"
 
           if [ "${BASELINE_ONLY}" = "1" ]; then
             echo "# Veracode Findings Diff — ${APP_NAME}" > out/diff/README.md
@@ -134,11 +133,14 @@ jobs:
             exit 0
           fi
 
-          PREV="prev_artifact/unzipped/out/findings_single_app_${APP_NAME}.json"
-          if [ ! -f "$PREV" ]; then
-            echo "Previous findings not found in previous artifact: $PREV"
+          PREV="$(find prev_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}.json" | head -n 1 || true)"
+          if [ -z "$PREV" ]; then
+            echo "Previous findings not found in previous artifact."
+            echo "Debug: listing findings_single_app_*.json under prev_artifact/unzipped:"
+            find prev_artifact/unzipped -maxdepth 6 -type f -name "findings_single_app_*.json" -print || true
             exit 1
           fi
+          echo "Using PREV=$PREV"
 
           python scripts/diff_reporting_findings.py \
             --app-name "${APP_NAME}" \
