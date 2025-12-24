@@ -290,7 +290,8 @@ def build_pdf(summary: Dict[str, Any], out_pdf: str) -> None:
     for level_obj in (summary.get("severity") or []):
         lvl = level_obj.get("level")
         for cat in (level_obj.get("category") or []):
-            sev_rows.append([lvl, cat.get("severity"), cat.get("category_name"), cat.get("count")])
+            category = cat.get("categoryname") or cat.get("category_name") or cat.get("categoryName")
+            sev_rows.append([lvl, cat.get("severity"), category, cat.get("count")])
     if sev_rows:
         elems += make_table(
             styles,
