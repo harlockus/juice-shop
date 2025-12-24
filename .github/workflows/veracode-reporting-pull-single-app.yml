@@ -1,4 +1,4 @@
-name: Veracode Reporting API - Findings (Single App)
+name: Veracode Reporting API - Findings (Single App, JSON + Lossless Excel)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: "Juice-Shop-GitHub-Demo"
       last_updated_start_date:
-        description: "Start date (YYYY-MM-DD). Use an earlier date for first run."
+        description: "Start date (YYYY-MM-DD). Example: 2025-12-01"
         required: true
         default: "2025-12-01"
 
@@ -17,7 +17,7 @@ permissions:
   actions: write
 
 jobs:
-  pull_findings_single_app:
+  reporting_findings_single_app:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -31,9 +31,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests veracode-api-signing
+          pip install requests veracode-api-signing pandas openpyxl
 
-      - name: Pull Findings via Reporting API (resolve app IDs, generate, poll, paginate, filter)
+      - name: Run Reporting API export (resolve app IDs, generate, poll, paginate, filter, Excel)
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
@@ -43,7 +43,7 @@ jobs:
         run: |
           python scripts/pull_reporting_findings_single_app.py
 
-      - name: Upload output
+      - name: Upload output (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
