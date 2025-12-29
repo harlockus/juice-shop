@@ -114,7 +114,7 @@ jobs:
           mkdir -p out/diff
           BASELINE_ONLY="${BASELINE_ONLY:-0}"
 
-          CUR="$(find cur_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}.json" | head -n 1 || true)"
+          CUR="$(find cur_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}*.json" | head -n 1 || true)"
           if [ -z "$CUR" ]; then
             echo "Current findings not found in latest artifact."
             echo "Debug: listing findings_single_app_*.json under cur_artifact/unzipped:"
@@ -133,7 +133,7 @@ jobs:
             exit 0
           fi
 
-          PREV="$(find prev_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}.json" | head -n 1 || true)"
+          PREV="$(find prev_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}*.json" | head -n 1 || true)"
           if [ -z "$PREV" ]; then
             echo "Previous findings not found in previous artifact."
             echo "Debug: listing findings_single_app_*.json under prev_artifact/unzipped:"
