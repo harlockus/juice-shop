@@ -1,4 +1,4 @@
-name: Veracode Pipeline Scan (GitHub Code Scanning)
+name: Veracode Pipeline Scan (Ultimate SARIF for GitHub Code Scanning)
 
 on:
   workflow_dispatch:
@@ -21,6 +21,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # This file is guaranteed to exist for “no-file-location” findings,
+      # so GitHub Code Scanning will always accept the SARIF.
+      - name: Ensure placeholder file exists for global findings
+        run: |
+          mkdir -p .veracode
+          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
+          # Veracode Pipeline Scan – Global Findings Placeholder
+
+          Some Pipeline Scan findings are not associated with a specific file/line.
+          These findings are anchored to this file so GitHub Code Scanning can display them.
+          EOF
+
       - name: Create source zip (exclude node_modules)
         run: |
           zip -r pipeline-src.zip . \
@@ -39,6 +51,7 @@ jobs:
           unzip -o pipeline-scan-LATEST.zip
 
       - name: Run Veracode Pipeline Scan
+        # Keep the job going so SARIF + artifacts still upload even when flaws exist.
         continue-on-error: true
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
@@ -66,23 +79,17 @@ jobs:
               "0": "INFO"
           }
 
-          try:
-              with open("results.json", "r", encoding="utf-8") as f:
-                  data = json.load(f)
-          except Exception as e:
-              print("Could not read results.json:", e)
-              raise SystemExit(0)
+          with open("results.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
 
           findings = data.get("findings") or data.get("issues") or data.get("results") or []
           if not isinstance(findings, list):
-              print("No findings array detected.")
-              raise SystemExit(0)
+              findings = []
 
           c = Counter()
-          for f in findings:
-              raw = str(f.get("severity") or f.get("severity_level") or f.get("severityCode") or "UNKNOWN")
-              sev = SEVERITY_MAP.get(raw, raw)
-              c[sev] += 1
+          for it in findings:
+              raw = str(it.get("severity") or it.get("severity_level") or it.get("severityCode") or "UNKNOWN")
+              c[SEVERITY_MAP.get(raw, raw)] += 1
 
           print("\n=== Veracode Pipeline Scan Summary ===")
           for sev in ["VERY_HIGH","HIGH","MEDIUM","LOW","VERY_LOW","INFO","UNKNOWN"]:
@@ -92,17 +99,22 @@ jobs:
           print("====================================\n")
           PY
 
-      - name: Convert Pipeline Scan results to SARIF
+      - name: Convert Pipeline Scan results to SARIF (capture 100% of findings)
         run: |
-          python scripts/pipeline_results_to_sarif.py results.json veracode-pipeline.sarif
+          python scripts/pipeline_results_to_sarif.py \
+            --input results.json \
+            --output veracode-pipeline.sarif \
+            --placeholder-uri .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md \
+            --output-stats veracode-pipeline-sarif-stats.json
 
       - name: Upload SARIF to GitHub Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: veracode-pipeline.sarif
           category: veracode-pipeline
+          wait-for-processing: true
 
-      - name: Upload Pipeline Scan JSON outputs
+      - name: Upload Pipeline Scan outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -111,3 +123,5 @@ jobs:
             results.json
             filtered_results.json
             veracode-pipeline.sarif
+            veracode-pipeline-sarif-stats.json
+            .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md
