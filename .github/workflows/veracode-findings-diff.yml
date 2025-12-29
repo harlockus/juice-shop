@@ -7,6 +7,10 @@ on:
         description: "Veracode application profile name (exact match)"
         required: true
         default: "Juice-Shop-GitHub-Demo"
+      sandbox_name:
+        description: "Optional: sandbox name. Leave blank for POLICY diffs. Set to exact sandbox name for SANDBOX diffs."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -106,36 +110,49 @@ jobs:
 
           echo "BASELINE_ONLY=${BASELINE_ONLY}" >> $GITHUB_ENV
 
-      - name: Find JSON files in artifacts and run diff
+      - name: Find JSON files in artifacts and run diff (explicit policy vs sandbox)
         env:
           APP_NAME: ${{ inputs.application_name }}
+          SANDBOX_NAME: ${{ inputs.sandbox_name }}
         run: |
           set -euo pipefail
           mkdir -p out/diff
           BASELINE_ONLY="${BASELINE_ONLY:-0}"
 
-          CUR="$(find cur_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}*.json" | head -n 1 || true)"
+          # Construct exact expected filename (policy vs sandbox)
+          if [ -n "${SANDBOX_NAME}" ]; then
+            TARGET="findings_single_app_${APP_NAME}__sandbox__${SANDBOX_NAME}.json"
+            MODE="SANDBOX"
+          else
+            TARGET="findings_single_app_${APP_NAME}.json"
+            MODE="POLICY"
+          fi
+
+          echo "Diff mode: ${MODE}"
+          echo "Expected filename: ${TARGET}"
+
+          CUR="$(find cur_artifact/unzipped -type f -name "${TARGET}" | head -n 1 || true)"
           if [ -z "$CUR" ]; then
-            echo "Current findings not found in latest artifact."
+            echo "Current findings not found for ${MODE} mode."
+            echo "Looked for: ${TARGET}"
             echo "Debug: listing findings_single_app_*.json under cur_artifact/unzipped:"
             find cur_artifact/unzipped -maxdepth 6 -type f -name "findings_single_app_*.json" -print || true
-            echo "Debug: listing first 50 json files under cur_artifact/unzipped:"
-            find cur_artifact/unzipped -maxdepth 6 -type f -name "*.json" -print | head -n 50 || true
             exit 1
           fi
           echo "Using CUR=$CUR"
 
           if [ "${BASELINE_ONLY}" = "1" ]; then
-            echo "# Veracode Findings Diff — ${APP_NAME}" > out/diff/README.md
+            echo "# Veracode Findings Diff — ${APP_NAME} (${MODE})" > out/diff/README.md
             echo "" >> out/diff/README.md
             echo "Only one reporting snapshot exists in GitHub artifacts." >> out/diff/README.md
-            echo "Run veracode-reporting-pull-single-app.yml again to enable A/B/C/D diffs." >> out/diff/README.md
+            echo "Run veracode-reporting-pull-single-app.yml again (same mode) to enable diffs." >> out/diff/README.md
             exit 0
           fi
 
-          PREV="$(find prev_artifact/unzipped -type f -name "findings_single_app_${APP_NAME}*.json" | head -n 1 || true)"
+          PREV="$(find prev_artifact/unzipped -type f -name "${TARGET}" | head -n 1 || true)"
           if [ -z "$PREV" ]; then
-            echo "Previous findings not found in previous artifact."
+            echo "Previous findings not found for ${MODE} mode."
+            echo "Looked for: ${TARGET}"
             echo "Debug: listing findings_single_app_*.json under prev_artifact/unzipped:"
             find prev_artifact/unzipped -maxdepth 6 -type f -name "findings_single_app_*.json" -print || true
             exit 1
@@ -143,7 +160,7 @@ jobs:
           echo "Using PREV=$PREV"
 
           python scripts/diff_reporting_findings.py \
-            --app-name "${APP_NAME}" \
+            --app-name "${APP_NAME}${SANDBOX_NAME:+__sandbox__${SANDBOX_NAME}}" \
             --current "$CUR" \
             --previous "$PREV" \
             --out-dir "out/diff"
