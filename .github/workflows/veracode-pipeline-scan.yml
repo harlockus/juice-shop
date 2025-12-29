@@ -1,11 +1,17 @@
-name: Veracode Pipeline Scan (Juice Shop)
+name: Veracode Pipeline Scan (GitHub Code Scanning)
 
 on:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
 
 permissions:
   contents: read
-  actions: write
+  actions: read
+  security-events: write
 
 jobs:
   pipeline_scan:
@@ -17,7 +23,7 @@ jobs:
 
       - name: Create source zip (exclude node_modules)
         run: |
-          zip -r juice-shop-src.zip . \
+          zip -r pipeline-src.zip . \
             -x "**/node_modules/**" \
             -x "**/.git/**"
 
@@ -33,7 +39,7 @@ jobs:
           unzip -o pipeline-scan-LATEST.zip
 
       - name: Run Veracode Pipeline Scan
-        continue-on-error: true   # do NOT fail job just because flaws exist
+        continue-on-error: true
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
@@ -41,7 +47,7 @@ jobs:
           java -jar pipeline-scan.jar \
             --veracode_api_id "${VERACODE_API_ID}" \
             --veracode_api_key "${VERACODE_API_KEY}" \
-            --file "juice-shop-src.zip" \
+            --file "pipeline-src.zip" \
             --json_output_file "results.json" \
             --filtered_json_output_file "filtered_results.json"
 
@@ -52,7 +58,7 @@ jobs:
           from collections import Counter
 
           SEVERITY_MAP = {
-              "5": "VERY_HIGH",  # Policy Scan / Reporting API only
+              "5": "VERY_HIGH",
               "4": "HIGH",
               "3": "MEDIUM",
               "2": "LOW",
@@ -67,41 +73,41 @@ jobs:
               print("Could not read results.json:", e)
               raise SystemExit(0)
 
-          findings = (
-              data.get("findings")
-              or data.get("issues")
-              or data.get("results")
-              or []
-          )
-
+          findings = data.get("findings") or data.get("issues") or data.get("results") or []
           if not isinstance(findings, list):
               print("No findings array detected.")
               raise SystemExit(0)
 
-          counts = Counter()
-
+          c = Counter()
           for f in findings:
-              raw = str(
-                  f.get("severity")
-                  or f.get("severity_level")
-                  or f.get("severityCode")
-                  or "UNKNOWN"
-              )
+              raw = str(f.get("severity") or f.get("severity_level") or f.get("severityCode") or "UNKNOWN")
               sev = SEVERITY_MAP.get(raw, raw)
-              counts[sev] += 1
+              c[sev] += 1
 
           print("\n=== Veracode Pipeline Scan Summary ===")
-          for sev in ["HIGH", "MEDIUM", "LOW", "VERY_LOW", "INFO"]:
-              if counts.get(sev):
-                  print(f"{sev}: {counts[sev]}")
-          print(f"TOTAL ISSUES: {sum(counts.values())}")
+          for sev in ["VERY_HIGH","HIGH","MEDIUM","LOW","VERY_LOW","INFO","UNKNOWN"]:
+              if c.get(sev):
+                  print(f"{sev}: {c[sev]}")
+          print(f"TOTAL ISSUES: {sum(c.values())}")
           print("====================================\n")
           PY
 
-      - name: Upload Pipeline Scan results
+      - name: Convert Pipeline Scan results to SARIF
+        run: |
+          python scripts/pipeline_results_to_sarif.py results.json veracode-pipeline.sarif
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: veracode-pipeline.sarif
+          category: veracode-pipeline
+
+      - name: Upload Pipeline Scan JSON outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: veracode-pipeline-scan-results
           path: |
             results.json
             filtered_results.json
+            veracode-pipeline.sarif
