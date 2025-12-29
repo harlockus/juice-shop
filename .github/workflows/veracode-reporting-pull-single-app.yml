@@ -11,13 +11,17 @@ on:
         description: "Start date (YYYY-MM-DD). Example: 2025-12-01"
         required: true
         default: "2025-12-01"
+      sandbox_name:
+        description: "Optional: sandbox name (exact match). Leave blank for Policy context."
+        required: false
+        default: ""
 
 permissions:
   contents: read
   actions: write
 
 jobs:
-  reporting_findings_single_app:
+  pull_findings_single_app:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,13 +37,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests veracode-api-signing pandas openpyxl
 
-      - name: Run Reporting API export (resolve app IDs, generate, poll, paginate, filter, Excel)
+      - name: Pull Findings via Reporting API (policy or sandbox)
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
           VERACODE_API_BASE: ${{ secrets.VERACODE_API_BASE }}
           APPLICATION_NAME: ${{ inputs.application_name }}
           LAST_UPDATED_START_DATE: ${{ inputs.last_updated_start_date }}
+          SANDBOX_NAME: ${{ inputs.sandbox_name }}
         run: |
           python scripts/pull_reporting_findings_single_app.py
 
