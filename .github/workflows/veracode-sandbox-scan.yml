@@ -1,0 +1,51 @@
+name: Veracode Sandbox Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "Veracode application name (must match the App Profile name)"
+        required: true
+        default: "Juice-Shop-GitHub-Demo"
+      sandbox_name:
+        description: "Sandbox name (exact match). Example: Juice-Shop-GitHub-Demo-Sandbox"
+        required: true
+        default: "Juice-Shop-GitHub-Demo-Sandbox"
+      create_sandbox:
+        description: "Create the sandbox if it does not exist (true/false)"
+        required: true
+        default: "true"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  sandbox_scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source zip (exclude node_modules)
+        run: |
+          zip -r juice-shop-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+
+      - name: Veracode Upload & Scan (Sandbox)
+        uses: veracode/veracode-uploadandscan-action@0.2.11
+        with:
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+
+          appname: ${{ inputs.app_name }}
+          createprofile: false
+          filepath: "juice-shop-src.zip"
+
+          # Sandbox controls
+          sandboxname: ${{ inputs.sandbox_name }}
+          createsandbox: ${{ inputs.create_sandbox }}
+
+          # Recommended stability options
+          scanallnonfataltoplevelmodules: true
+          deleteincompletescan: 1
