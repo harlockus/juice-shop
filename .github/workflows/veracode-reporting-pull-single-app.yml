@@ -1,4 +1,4 @@
-name: Veracode Reporting API - Findings (Single App, JSON + Lossless Excel)
+name: Veracode Reporting API - Findings (Single App, JSON + Lossless Excel + SARIF)
 
 on:
   workflow_dispatch:
@@ -8,21 +8,23 @@ on:
         required: true
         default: "Juice-Shop-GitHub-Demo"
       last_updated_start_date:
-        description: "Start date (YYYY-MM-DD). Example: 2025-12-01"
+        description: "Start date (YYYY-MM-DD)"
         required: true
         default: "2025-12-01"
       sandbox_name:
-        description: "Optional: sandbox name (exact match). Leave blank for Policy context."
+        description: "Optional: sandbox name (exact match). Blank = Policy context."
         required: false
         default: ""
 
 permissions:
   contents: read
-  actions: write
+  actions: read
+  security-events: write
 
 jobs:
   pull_findings_single_app:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,9 +50,45 @@ jobs:
         run: |
           python scripts/pull_reporting_findings_single_app.py
 
+      # Placeholder file required so SARIF upload never fails on findings without a file/line.
+      - name: Ensure placeholder file exists (Reporting SARIF)
+        run: |
+          mkdir -p .veracode
+          cat > .veracode/REPORTING_GLOBAL_FINDINGS.md << 'EOF'
+          # Veracode Reporting API – Global Findings Placeholder
+          Findings without file+line are anchored here so GitHub Code Scanning can display them.
+          EOF
+
+      - name: Locate scoped findings JSON
+        run: |
+          set -euo pipefail
+          # The reporting script produces out/findings_single_app_<APP>[__sandbox__<SANDBOX>].json
+          FINDINGS_JSON="$(ls -1 out/findings_single_app_*.json | head -n 1)"
+          echo "FINDINGS_JSON=$FINDINGS_JSON" >> $GITHUB_ENV
+          echo "Using findings JSON: $FINDINGS_JSON"
+
+      - name: Convert Reporting findings to SARIF
+        run: |
+          python scripts/reporting_findings_to_sarif.py \
+            --input "$FINDINGS_JSON" \
+            --output veracode-reporting.sarif \
+            --placeholder-uri .veracode/REPORTING_GLOBAL_FINDINGS.md \
+            --output-stats veracode-reporting-sarif-stats.json
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: veracode-reporting.sarif
+          category: veracode-reporting
+          wait-for-processing: true
+
       - name: Upload output (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: veracode-reporting-findings-single-app
-          path: out/
+          path: |
+            out/
+            veracode-reporting.sarif
+            veracode-reporting-sarif-stats.json
+            .veracode/REPORTING_GLOBAL_FINDINGS.md
