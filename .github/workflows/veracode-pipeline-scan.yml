@@ -1,12 +1,12 @@
-name: Veracode Pipeline Scan (SARIF w/ Clickable Lines)
+name: Veracode Pipeline Scan (Ultimate: SARIF + Fix Input)
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  security-events: write
   actions: read
+  security-events: write
 
 jobs:
   pipeline_scan:
@@ -31,17 +31,31 @@ jobs:
           curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip
 
-      - name: Run Pipeline Scan
+      - name: Run Pipeline Scan (do not fail job on findings)
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
         run: |
+          set -euo pipefail
+
+          set +e
           java -jar pipeline-scan.jar \
             -vid "${VERACODE_API_ID}" \
             -vkey "${VERACODE_API_KEY}" \
             -f "pipeline-src.zip" \
             -jf "results.json" \
             -fjf "filtered_results.json"
+          RC=$?
+          set -e
+
+          echo "Pipeline Scan exit code: $RC"
+          ls -lah results.json filtered_results.json || true
+
+          # Only fail if no outputs were produced (real failure)
+          if [ ! -f results.json ] || [ ! -f filtered_results.json ]; then
+            echo "ERROR: Pipeline Scan did not produce results.json / filtered_results.json"
+            exit 1
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -56,7 +70,7 @@ jobs:
           Findings without a resolvable repo file+line are anchored here.
           EOF
 
-      - name: Convert Pipeline Scan JSON -> SARIF (clickable where possible)
+      - name: Convert Pipeline JSON -> SARIF (real file+line where possible)
         run: |
           python scripts/pipeline_results_to_sarif.py \
             --input filtered_results.json \
