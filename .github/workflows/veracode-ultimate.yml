@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       has_results: ${{ steps.scan_outputs.outputs.has_results }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,7 +94,7 @@ jobs:
           category: veracode-pipeline
           wait-for-processing: true
 
-      - name: Upload artifacts
+      - name: Upload pipeline artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -111,55 +112,66 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.detector.outputs.matrix }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect Fix languages (repo-based)
+      - name: Detect Fix languages (repo-based, no broken pipes)
         id: detector
         run: |
           set -euo pipefail
 
           found=()
 
+          add_lang () {
+            local lang="$1"
+            for x in "${found[@]:-}"; do
+              if [ "$x" = "$lang" ]; then
+                return 0
+              fi
+            done
+            found+=("$lang")
+          }
+
           # Java
-          if find . -type f -name "*.java" -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("java")
+          if find . -type f -name "*.java" -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "java"
           fi
 
           # C#
-          if find . -type f \( -name "*.cs" -o -name "*.csproj" -o -name "*.sln" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("csharp")
+          if find . -type f \( -name "*.cs" -o -name "*.csproj" -o -name "*.sln" \) -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "csharp"
           fi
 
-          # JavaScript/TypeScript
-          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "package.json" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("javascript")
+          # JavaScript / TypeScript
+          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "package.json" \) -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "javascript"
           fi
 
           # Python
-          if find . -type f \( -name "*.py" -o -name "requirements.txt" -o -name "pyproject.toml" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("python")
+          if find . -type f \( -name "*.py" -o -name "requirements.txt" -o -name "pyproject.toml" \) -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "python"
           fi
 
           # Kotlin
-          if find . -type f -name "*.kt" -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("kotlin")
+          if find . -type f -name "*.kt" -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "kotlin"
           fi
 
           # Scala
-          if find . -type f -name "*.scala" -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("scala")
+          if find . -type f -name "*.scala" -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "scala"
           fi
 
           # PHP
-          if find . -type f \( -name "*.php" -o -name "composer.json" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("php")
+          if find . -type f \( -name "*.php" -o -name "composer.json" \) -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "php"
           fi
 
           # Go
-          if find . -type f \( -name "*.go" -o -name "go.mod" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
-            found+=("go")
+          if find . -type f \( -name "*.go" -o -name "go.mod" \) -not -path "./.git/*" -print -quit | grep -q .; then
+            add_lang "go"
           fi
 
           if [ ${#found[@]} -eq 0 ]; then
@@ -168,7 +180,6 @@ jobs:
             exit 0
           fi
 
-          # Build a GitHub matrix JSON: {"include":[{"language":"java"},...]}
           json='{"include":['
           first=1
           for lang in "${found[@]}"; do
@@ -217,6 +228,12 @@ jobs:
           prComment: true
           createPR: true
 
-          # Safe generic rewrites (used when relevant; harmless otherwise)
+          # Java webapps (harmless elsewhere)
           source_base_path_1: "WEB-INF/:src/main/webapp/WEB-INF/"
           source_base_path_2: "com/:src/main/java/com/"
+
+          # JS/TS common roots (identity rewrites prevent undefinedroutes/... path issues)
+          source_base_path_3: "routes/:routes/"
+          source_base_path_4: "frontend/:frontend/"
+          source_base_path_5: "lib/:lib/"
+          source_base_path_6: "src/:src/"
