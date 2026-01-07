@@ -1,0 +1,146 @@
+name: Veracode Ultimate (Pipeline Scan + SARIF + Fix All Languages)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  security-events: write
+
+jobs:
+  pipeline_scan_and_sarif:
+    runs-on: ubuntu-latest
+    outputs:
+      has_results: ${{ steps.scan_outputs.outputs.has_results }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure placeholder file exists (SARIF)
+        run: |
+          mkdir -p .veracode
+          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
+          # Veracode Pipeline Scan – Global Findings Placeholder
+          Findings without a resolvable repo file+line are anchored here.
+          EOF
+
+      - name: Create source zip (exclude node_modules)
+        run: |
+          zip -r pipeline-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+
+      - name: Set up Java (Pipeline Scan tool)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Pipeline Scan tool
+        run: |
+          curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o pipeline-scan-LATEST.zip
+
+      - name: Run Pipeline Scan (do not fail job on findings)
+        id: scan_outputs
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          set +e
+          java -jar pipeline-scan.jar \
+            -vid "${VERACODE_API_ID}" \
+            -vkey "${VERACODE_API_KEY}" \
+            -f "pipeline-src.zip" \
+            -esd true \
+            -jf "results.json" \
+            -fjf "filtered_results.json"
+          RC=$?
+          set -e
+
+          echo "Pipeline Scan exit code: $RC"
+          ls -lah results.json filtered_results.json || true
+
+          if [ -f results.json ] && [ -f filtered_results.json ]; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            echo "ERROR: Pipeline Scan did not produce results.json / filtered_results.json"
+            exit 1
+          fi
+
+      - name: Setup Python (SARIF conversion)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Convert Pipeline JSON -> SARIF
+        run: |
+          python scripts/pipeline_results_to_sarif.py \
+            --input filtered_results.json \
+            --output veracode-pipeline.sarif \
+            --placeholder-uri .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md \
+            --output-stats veracode-pipeline-sarif-stats.json
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: veracode-pipeline.sarif
+          category: veracode-pipeline
+          wait-for-processing: true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-pipeline-scan
+          path: |
+            results.json
+            filtered_results.json
+            veracode-pipeline.sarif
+            veracode-pipeline-sarif-stats.json
+            .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md
+
+  veracode_fix_all_languages:
+    needs: pipeline_scan_and_sarif
+    if: needs.pipeline_scan_and_sarif.outputs.has_results == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ java, csharp, javascript, python, kotlin, scala, php, go ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download pipeline results
+        uses: actions/download-artifact@v4
+        with:
+          name: veracode-pipeline-scan
+          path: pipeline_out
+
+      - name: Verify Fix input exists
+        run: |
+          set -euo pipefail
+          test -f pipeline_out/filtered_results.json
+
+      - name: Run Veracode Fix (Batch PR) — matrix language=${{ matrix.language }}
+        uses: veracode/veracode-fix-github-action@v1.0.4
+        with:
+          vid: ${{ secrets.VID }}
+          vkey: ${{ secrets.VKEY }}
+          inputFile: pipeline_out/filtered_results.json
+          language: ${{ matrix.language }}
+          fixType: batch
+          files: all
+          prComment: true
+          createPR: true
+
+          # Safe generic rewrites (helps common web/java layouts; harmless if unused)
+          source_base_path_1: "WEB-INF/:src/main/webapp/WEB-INF/"
+          source_base_path_2: "com/:src/main/java/com/"
