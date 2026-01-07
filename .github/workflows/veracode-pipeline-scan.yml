@@ -1,17 +1,12 @@
-name: Veracode Pipeline Scan (Ultimate SARIF for GitHub Code Scanning)
+name: Veracode Pipeline Scan (SARIF w/ Clickable Lines)
 
 on:
   workflow_dispatch:
-  pull_request:
-  push:
-    branches:
-      - master
-      - main
 
 permissions:
   contents: read
-  actions: read
   security-events: write
+  actions: read
 
 jobs:
   pipeline_scan:
@@ -21,23 +16,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # This file is guaranteed to exist for “no-file-location” findings,
-      # so GitHub Code Scanning will always accept the SARIF.
-      - name: Ensure placeholder file exists for global findings
-        run: |
-          mkdir -p .veracode
-          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
-          # Veracode Pipeline Scan – Global Findings Placeholder
-
-          Some Pipeline Scan findings are not associated with a specific file/line.
-          These findings are anchored to this file so GitHub Code Scanning can display them.
-          EOF
-
       - name: Create source zip (exclude node_modules)
         run: |
-          zip -r pipeline-src.zip . \
-            -x "**/node_modules/**" \
-            -x "**/.git/**"
+          zip -r pipeline-src.zip . -x "**/node_modules/**" -x "**/.git/**"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -45,64 +26,40 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Download Veracode Pipeline Scan tool
+      - name: Download Pipeline Scan tool
         run: |
           curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip
 
-      - name: Run Veracode Pipeline Scan
-        # Keep the job going so SARIF + artifacts still upload even when flaws exist.
-        continue-on-error: true
+      - name: Run Pipeline Scan
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
         run: |
           java -jar pipeline-scan.jar \
-            --veracode_api_id "${VERACODE_API_ID}" \
-            --veracode_api_key "${VERACODE_API_KEY}" \
-            --file "pipeline-src.zip" \
-            --json_output_file "results.json" \
-            --filtered_json_output_file "filtered_results.json"
+            -vid "${VERACODE_API_ID}" \
+            -vkey "${VERACODE_API_KEY}" \
+            -f "pipeline-src.zip" \
+            -jf "results.json" \
+            -fjf "filtered_results.json"
 
-      - name: Summarize vulnerabilities (from results.json)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ensure placeholder file exists (Pipeline SARIF)
         run: |
-          python - << 'PY'
-          import json
-          from collections import Counter
+          mkdir -p .veracode
+          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
+          # Veracode Pipeline Scan – Global Findings Placeholder
+          Findings without a resolvable repo file+line are anchored here.
+          EOF
 
-          SEVERITY_MAP = {
-              "5": "VERY_HIGH",
-              "4": "HIGH",
-              "3": "MEDIUM",
-              "2": "LOW",
-              "1": "VERY_LOW",
-              "0": "INFO"
-          }
-
-          with open("results.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          findings = data.get("findings") or data.get("issues") or data.get("results") or []
-          if not isinstance(findings, list):
-              findings = []
-
-          c = Counter()
-          for it in findings:
-              raw = str(it.get("severity") or it.get("severity_level") or it.get("severityCode") or "UNKNOWN")
-              c[SEVERITY_MAP.get(raw, raw)] += 1
-
-          print("\n=== Veracode Pipeline Scan Summary ===")
-          for sev in ["VERY_HIGH","HIGH","MEDIUM","LOW","VERY_LOW","INFO","UNKNOWN"]:
-              if c.get(sev):
-                  print(f"{sev}: {c[sev]}")
-          print(f"TOTAL ISSUES: {sum(c.values())}")
-          print("====================================\n")
-          PY
-
-      - name: Convert Pipeline Scan results to SARIF (capture 100% of findings)
+      - name: Convert Pipeline Scan JSON -> SARIF (clickable where possible)
         run: |
           python scripts/pipeline_results_to_sarif.py \
-            --input results.json \
+            --input filtered_results.json \
             --output veracode-pipeline.sarif \
             --placeholder-uri .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md \
             --output-stats veracode-pipeline-sarif-stats.json
@@ -114,11 +71,11 @@ jobs:
           category: veracode-pipeline
           wait-for-processing: true
 
-      - name: Upload Pipeline Scan outputs
+      - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: veracode-pipeline-scan-results
+          name: veracode-pipeline-scan
           path: |
             results.json
             filtered_results.json
