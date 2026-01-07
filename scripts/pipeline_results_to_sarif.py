@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Veracode Pipeline Scan JSON -> SARIF 2.1.0 for GitHub Code Scanning.
+Veracode Pipeline Scan JSON -> SARIF 2.1.0 (GitHub Code Scanning).
 
-Fixes "not clickable" results by using real file+line locations from Pipeline Scan JSON:
-- Prefer: findings[].files.source_file.file + findings[].files.source_file.line
-- Fallback: findings[].image_path
-- Only use placeholder when no real repo file/line can be resolved
+Goals:
+- Show ALL findings in GitHub Code Scanning
+- Use real repo file+line whenever possible
+- Otherwise anchor to a placeholder file with stable line numbers
+- Works with results.json or filtered_results.json
 
-Input JSON can be:
-- filtered_results.json (recommended for Fix + smaller payload)
-- results.json
-Both share the same top-level shape: { ..., "findings": [ ... ] }
+Expected Pipeline JSON shape:
+{ ..., "findings": [ { ... } ] }
+Each finding usually has:
+  - severity (0-5)
+  - cwe_id
+  - issue_type / title
+  - issue_id
+  - files.source_file.file
+  - files.source_file.line
 """
 
 import argparse
@@ -28,8 +34,13 @@ SEV_MAP = {
     "0": ("note",    "INFO",      "0.1"),
 }
 
-DEFAULT_SOURCE_ROOTS = [
-    "",  # repo root
+# Try common Java/web roots (safe even if they don't exist)
+SOURCE_ROOTS = [
+    "",
+    "src/main/java/",
+    "src/main/webapp/",
+    "src/main/resources/",
+    "src/",
 ]
 
 def sha256_text(s: str) -> str:
@@ -55,28 +66,43 @@ def stable_placeholder_line(rule_id: str, msg: str) -> int:
     h = sha256_text(f"{rule_id}|{msg}")
     return (int(h[:8], 16) % 20000) + 1
 
-def resolve_repo_uri(repo_root: str, raw_path: str, source_roots: List[str]) -> Optional[str]:
-    raw_path = normalize_path(raw_path)
+def strip_build_prefix(p: str) -> str:
+    """
+    Strip common build output prefixes seen in pipeline scan results.
+    Examples:
+      target/verademo/WEB-INF/views/profile.jsp -> WEB-INF/views/profile.jsp
+      target/classes/com/x/Foo.class -> com/x/Foo.class
+    """
+    p = normalize_path(p)
+    if p.startswith("target/"):
+        rest = p[len("target/"):]
+        if "/" in rest:
+            rest = rest.split("/", 1)[1]
+        return rest
+    return p
 
-    # Try as-is and under common roots
-    for root in source_roots:
+def resolve_repo_uri(repo_root: str, raw_path: str) -> Optional[str]:
+    raw_path = strip_build_prefix(raw_path)
+
+    # Try under known source roots
+    for root in SOURCE_ROOTS:
         candidate = normalize_path((root + raw_path) if root else raw_path)
         full = os.path.join(repo_root, candidate)
         if os.path.isfile(full):
             return candidate
 
+    # Try raw as-is
+    raw_norm = normalize_path(raw_path)
+    if os.path.isfile(os.path.join(repo_root, raw_norm)):
+        return raw_norm
+
     return None
 
 def extract_file_and_line(finding: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Pipeline scan findings typically include:
-      finding["files"]["source_file"]["file"]
-      finding["files"]["source_file"]["line"]
-    """
     files = finding.get("files") or {}
     src = files.get("source_file") or {}
 
-    path = src.get("file") or src.get("upload_file") or finding.get("image_path")
+    path = src.get("file") or src.get("upload_file") or ""
     line = src.get("line")
 
     path_s = as_str(path).strip()
@@ -87,9 +113,6 @@ def extract_file_and_line(finding: Dict[str, Any]) -> Tuple[Optional[str], Optio
     return path_s, line_i
 
 def rule_id_from_finding(finding: Dict[str, Any]) -> Tuple[str, str, str]:
-    """
-    Returns: (rule_id, rule_name, rule_description)
-    """
     cwe_id = as_str(finding.get("cwe_id")).strip()
     issue_type = as_str(finding.get("issue_type")).strip()
     title = as_str(finding.get("title")).strip()
@@ -105,10 +128,10 @@ def rule_id_from_finding(finding: Dict[str, Any]) -> Tuple[str, str, str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Pipeline scan JSON (results.json or filtered_results.json)")
-    ap.add_argument("--output", required=True, help="SARIF output path")
-    ap.add_argument("--placeholder-uri", required=True, help="Repo-relative placeholder file used when no real file/line")
-    ap.add_argument("--output-stats", required=True, help="Stats JSON output path")
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--placeholder-uri", required=True)
+    ap.add_argument("--output-stats", required=True)
     ap.add_argument("--tool-name", default="Veracode Pipeline Scan")
     ap.add_argument("--tool-version", default="")
     args = ap.parse_args()
@@ -121,14 +144,15 @@ def main() -> None:
 
     findings = payload.get("findings") if isinstance(payload, dict) else None
     if not isinstance(findings, list):
-        raise SystemExit("Expected an object with a 'findings' array (Pipeline Scan JSON).")
+        raise SystemExit("Expected an object with a 'findings' array (pipeline results JSON).")
 
     rules: Dict[str, Dict[str, Any]] = {}
     results: List[Dict[str, Any]] = []
 
     total = 0
-    results_with_file = 0
-    results_with_placeholder = 0
+    with_file = 0
+    with_placeholder = 0
+    unresolved_paths = 0
 
     for finding in findings:
         if not isinstance(finding, dict):
@@ -141,29 +165,25 @@ def main() -> None:
         rid, rname, rdesc = rule_id_from_finding(finding)
 
         issue_id = as_str(finding.get("issue_id")).strip()
-        title = as_str(finding.get("title")).strip()
-        msg_core = rdesc
-        msg = f"[{sev_label}] {msg_core}" + (f" (issue_id={issue_id})" if issue_id else "")
+        msg = f"[{sev_label}] {rdesc}" + (f" (issue_id={issue_id})" if issue_id else "")
 
         raw_path, raw_line = extract_file_and_line(finding)
 
-        uri: str
-        start_line: int
-
-        if raw_path:
-            resolved = resolve_repo_uri(repo_root, raw_path, DEFAULT_SOURCE_ROOTS)
-            if resolved and raw_line:
+        if raw_path and raw_line:
+            resolved = resolve_repo_uri(repo_root, raw_path)
+            if resolved:
                 uri = resolved
                 start_line = int(raw_line)
-                results_with_file += 1
+                with_file += 1
             else:
                 uri = placeholder_uri
                 start_line = stable_placeholder_line(rid, msg)
-                results_with_placeholder += 1
+                with_placeholder += 1
+                unresolved_paths += 1
         else:
             uri = placeholder_uri
             start_line = stable_placeholder_line(rid, msg)
-            results_with_placeholder += 1
+            with_placeholder += 1
 
         if rid not in rules:
             rules[rid] = {
@@ -196,7 +216,6 @@ def main() -> None:
                 "isPlaceholderLocation": (uri == placeholder_uri),
                 "raw_path": as_str(raw_path),
                 "raw_line": as_str(raw_line),
-                "title": title,
             },
         })
 
@@ -220,16 +239,17 @@ def main() -> None:
         "findings_total_in_json": total,
         "sarif_results_written": len(results),
         "sarif_rules_written": len(rules),
-        "results_with_file_location": results_with_file,
-        "results_with_placeholder_location": results_with_placeholder,
+        "results_with_file_location": with_file,
+        "results_with_placeholder_location": with_placeholder,
+        "unresolved_paths_count": unresolved_paths,
         "placeholder_uri": placeholder_uri,
         "repo_root": repo_root,
-        "source_roots_tried": DEFAULT_SOURCE_ROOTS,
+        "source_roots_tried": SOURCE_ROOTS,
     }
     with open(args.output_stats, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote SARIF: {args.output}")
+    print("SARIF written:", args.output)
     print(json.dumps(stats, indent=2))
 
 if __name__ == "__main__":
