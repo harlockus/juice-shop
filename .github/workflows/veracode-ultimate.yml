@@ -1,4 +1,4 @@
-name: Veracode Ultimate (Pipeline Scan + SARIF + Fix All Languages)
+name: Veracode Ultimate (Pipeline Scan + SARIF + Fix Auto-Detect)
 
 on:
   workflow_dispatch:
@@ -105,14 +105,89 @@ jobs:
             veracode-pipeline-sarif-stats.json
             .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md
 
-  veracode_fix_all_languages:
+  detect_fix_languages:
     needs: pipeline_scan_and_sarif
     if: needs.pipeline_scan_and_sarif.outputs.has_results == 'true'
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detector.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Fix languages (repo-based)
+        id: detector
+        run: |
+          set -euo pipefail
+
+          found=()
+
+          # Java
+          if find . -type f -name "*.java" -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("java")
+          fi
+
+          # C#
+          if find . -type f \( -name "*.cs" -o -name "*.csproj" -o -name "*.sln" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("csharp")
+          fi
+
+          # JavaScript/TypeScript
+          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "package.json" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("javascript")
+          fi
+
+          # Python
+          if find . -type f \( -name "*.py" -o -name "requirements.txt" -o -name "pyproject.toml" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("python")
+          fi
+
+          # Kotlin
+          if find . -type f -name "*.kt" -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("kotlin")
+          fi
+
+          # Scala
+          if find . -type f -name "*.scala" -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("scala")
+          fi
+
+          # PHP
+          if find . -type f \( -name "*.php" -o -name "composer.json" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("php")
+          fi
+
+          # Go
+          if find . -type f \( -name "*.go" -o -name "go.mod" \) -not -path "./.git/*" | head -n 1 | grep -q .; then
+            found+=("go")
+          fi
+
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "No Fix-supported languages detected. Skipping Fix."
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build a GitHub matrix JSON: {"include":[{"language":"java"},...]}
+          json='{"include":['
+          first=1
+          for lang in "${found[@]}"; do
+            if [ $first -eq 0 ]; then json+=','; fi
+            first=0
+            json+='{"language":"'"$lang"'"}'
+          done
+          json+=']}'
+
+          echo "Detected Fix languages: ${found[*]}"
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+  veracode_fix_detected:
+    needs: [pipeline_scan_and_sarif, detect_fix_languages]
+    if: needs.detect_fix_languages.outputs.matrix != ''
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:
-        language: [ java, csharp, javascript, python, kotlin, scala, php, go ]
+      matrix: ${{ fromJson(needs.detect_fix_languages.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -129,8 +204,9 @@ jobs:
           set -euo pipefail
           test -f pipeline_out/filtered_results.json
 
-      - name: Run Veracode Fix (Batch PR) — matrix language=${{ matrix.language }}
-        uses: veracode/veracode-fix-github-action@v1.0.4
+      - name: Run Veracode Fix (Batch PR) — language=${{ matrix.language }}
+        continue-on-error: true
+        uses: Veracode/veracode-fix@v1.0.4
         with:
           vid: ${{ secrets.VID }}
           vkey: ${{ secrets.VKEY }}
@@ -141,6 +217,6 @@ jobs:
           prComment: true
           createPR: true
 
-          # Safe generic rewrites (helps common web/java layouts; harmless if unused)
+          # Safe generic rewrites (used when relevant; harmless otherwise)
           source_base_path_1: "WEB-INF/:src/main/webapp/WEB-INF/"
           source_base_path_2: "com/:src/main/java/com/"
