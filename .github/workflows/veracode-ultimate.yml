@@ -215,6 +215,27 @@ jobs:
           set -euo pipefail
           test -f pipeline_out/filtered_results.json
 
+      # Choose ONE best root for JS/TS so we stay within Fix's 3 mapping limit.
+      - name: Detect best JS/TS root for Fix mapping
+        if: matrix.language == 'javascript'
+        run: |
+          set -euo pipefail
+          pick=""
+          for d in src routes frontend lib app server client packages; do
+            if [ -d "$d" ]; then
+              pick="$d"
+              break
+            fi
+          done
+
+          if [ -n "$pick" ]; then
+            echo "JS_ROOT=$pick" >> "$GITHUB_ENV"
+            echo "Detected JS_ROOT=$pick"
+          else
+            echo "JS_ROOT=" >> "$GITHUB_ENV"
+            echo "No common JS root folder found; defaulting to src/"
+          fi
+
       - name: Run Veracode Fix (Batch PR) — language=${{ matrix.language }}
         continue-on-error: true
         uses: Veracode/veracode-fix@v1.0.4
@@ -228,12 +249,12 @@ jobs:
           prComment: true
           createPR: true
 
-          # Java webapps (harmless elsewhere)
-          source_base_path_1: "WEB-INF/:src/main/webapp/WEB-INF/"
-          source_base_path_2: "com/:src/main/java/com/"
+          # Mapping slot 1: Java package paths
+          source_base_path_1: "com/:src/main/java/com/"
 
-          # JS/TS common roots (identity rewrites prevent undefinedroutes/... path issues)
-          source_base_path_3: "routes/:routes/"
-          source_base_path_4: "frontend/:frontend/"
-          source_base_path_5: "lib/:lib/"
-          source_base_path_6: "src/:src/"
+          # Mapping slot 2: Java webapp JSPs
+          source_base_path_2: "WEB-INF/:src/main/webapp/WEB-INF/"
+
+          # Mapping slot 3: dynamic for JS/TS repos (ONLY 1 slot available in Fix)
+          # If JS_ROOT is empty, we use src/:src/ as a safe default.
+          source_base_path_3: "${{ env.JS_ROOT && format('{0}/:{0}/', env.JS_ROOT) || 'src/:src/' }}"
