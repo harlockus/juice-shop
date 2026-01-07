@@ -2,19 +2,23 @@
 """
 Veracode Pipeline Scan JSON -> SARIF 2.1.0 for GitHub Code Scanning.
 
-Goals:
-- Every result has at least one location (required by GitHub).  [oai_citation:3‡GitHub Docs](https://docs.github.com/en/enterprise-cloud%40latest/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning?utm_source=chatgpt.com)
-- Stable, unique placeholder line numbers (prevents fingerprint conflicts).
-- Provide GitHub security severities via rules[].properties.security-severity (0.0–10.0).  [oai_citation:4‡GitHub Docs](https://docs.github.com/en/enterprise-cloud%40latest/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning?utm_source=chatgpt.com)
+Fixes "not clickable" results by using real file+line locations from Pipeline Scan JSON:
+- Prefer: findings[].files.source_file.file + findings[].files.source_file.line
+- Fallback: findings[].image_path
+- Only use placeholder when no real repo file/line can be resolved
+
+Input JSON can be:
+- filtered_results.json (recommended for Fix + smaller payload)
+- results.json
+Both share the same top-level shape: { ..., "findings": [ ... ] }
 """
 
 import argparse
 import hashlib
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
-# Map Veracode numeric severity -> (SARIF level, label, GitHub security-severity score)
-# GitHub expects security-severity as a numeric string 0.0–10.0.  [oai_citation:5‡GitHub Docs](https://docs.github.com/en/enterprise-cloud%40latest/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning?utm_source=chatgpt.com)
 SEV_MAP = {
     "5": ("error",   "VERY_HIGH", "9.5"),
     "4": ("error",   "HIGH",      "8.0"),
@@ -24,23 +28,21 @@ SEV_MAP = {
     "0": ("note",    "INFO",      "0.1"),
 }
 
+DEFAULT_SOURCE_ROOTS = [
+    "",  # repo root
+]
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def as_str(x: Any) -> str:
     return "" if x is None else str(x)
 
-def get_first(obj: Dict[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in obj and obj[k] is not None:
-            return obj[k]
-    return None
-
-def normalize_repo_path(p: str) -> str:
+def normalize_path(p: str) -> str:
     p = p.replace("\\", "/").strip()
     if p.startswith("./"):
         p = p[2:]
-    return p
+    return p.lstrip("/")
 
 def safe_int(x: Any, default: int = 1) -> int:
     try:
@@ -50,148 +52,185 @@ def safe_int(x: Any, default: int = 1) -> int:
         return default
 
 def stable_placeholder_line(rule_id: str, msg: str) -> int:
-    """
-    Create a stable line number (>=1) for placeholder findings.
-    This avoids many results pointing to the same (file,line) pair.
-    """
     h = sha256_text(f"{rule_id}|{msg}")
-    # 1..20000
     return (int(h[:8], 16) % 20000) + 1
+
+def resolve_repo_uri(repo_root: str, raw_path: str, source_roots: List[str]) -> Optional[str]:
+    raw_path = normalize_path(raw_path)
+
+    # Try as-is and under common roots
+    for root in source_roots:
+        candidate = normalize_path((root + raw_path) if root else raw_path)
+        full = os.path.join(repo_root, candidate)
+        if os.path.isfile(full):
+            return candidate
+
+    return None
+
+def extract_file_and_line(finding: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Pipeline scan findings typically include:
+      finding["files"]["source_file"]["file"]
+      finding["files"]["source_file"]["line"]
+    """
+    files = finding.get("files") or {}
+    src = files.get("source_file") or {}
+
+    path = src.get("file") or src.get("upload_file") or finding.get("image_path")
+    line = src.get("line")
+
+    path_s = as_str(path).strip()
+    if not path_s:
+        return None, None
+
+    line_i = safe_int(line, default=1) if line is not None else None
+    return path_s, line_i
+
+def rule_id_from_finding(finding: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    Returns: (rule_id, rule_name, rule_description)
+    """
+    cwe_id = as_str(finding.get("cwe_id")).strip()
+    issue_type = as_str(finding.get("issue_type")).strip()
+    title = as_str(finding.get("title")).strip()
+
+    if cwe_id:
+        rid = f"CWE-{cwe_id}" if not cwe_id.upper().startswith("CWE-") else cwe_id.upper()
+    else:
+        rid = "VERACODE-ISSUE"
+
+    name = issue_type or title or rid
+    desc = issue_type or title or name
+    return rid, name, desc
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--placeholder-uri", required=True)
-    ap.add_argument("--output-stats", required=True)
+    ap.add_argument("--input", required=True, help="Pipeline scan JSON (results.json or filtered_results.json)")
+    ap.add_argument("--output", required=True, help="SARIF output path")
+    ap.add_argument("--placeholder-uri", required=True, help="Repo-relative placeholder file used when no real file/line")
+    ap.add_argument("--output-stats", required=True, help="Stats JSON output path")
     ap.add_argument("--tool-name", default="Veracode Pipeline Scan")
     ap.add_argument("--tool-version", default="")
     args = ap.parse_args()
 
+    repo_root = os.getenv("GITHUB_WORKSPACE", os.getcwd())
+    placeholder_uri = normalize_path(args.placeholder_uri)
+
     with open(args.input, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        payload = json.load(f)
 
-    findings = data.get("findings") or data.get("issues") or data.get("results") or []
+    findings = payload.get("findings") if isinstance(payload, dict) else None
     if not isinstance(findings, list):
-        findings = []
-
-    placeholder_uri = normalize_repo_path(args.placeholder_uri)
+        raise SystemExit("Expected an object with a 'findings' array (Pipeline Scan JSON).")
 
     rules: Dict[str, Dict[str, Any]] = {}
     results: List[Dict[str, Any]] = []
 
-    count_total = 0
-    count_file_loc = 0
-    count_placeholder_loc = 0
+    total = 0
+    results_with_file = 0
+    results_with_placeholder = 0
 
-    for item in findings:
-        if not isinstance(item, dict):
+    for finding in findings:
+        if not isinstance(finding, dict):
             continue
-        count_total += 1
+        total += 1
 
-        sev_raw = as_str(get_first(item, "severity", "severity_level", "severityCode")).strip()
+        sev_raw = as_str(finding.get("severity")).strip()
         sarif_level, sev_label, gh_sec_score = SEV_MAP.get(sev_raw, ("warning", "UNKNOWN", "0.0"))
 
-        cwe = get_first(item, "cwe", "cwe_id", "cweId")
-        cwe_str = as_str(cwe).strip()
-        category = as_str(get_first(item, "category", "categoryname", "category_name")).strip()
+        rid, rname, rdesc = rule_id_from_finding(finding)
 
-        if cwe_str:
-            rule_id = cwe_str.upper() if cwe_str.upper().startswith("CWE-") else f"CWE-{cwe_str}"
-        elif category:
-            rule_id = f"VERACODE-{sha256_text(category)[:10].upper()}"
-        else:
-            rule_id = "VERACODE-ISSUE"
+        issue_id = as_str(finding.get("issue_id")).strip()
+        title = as_str(finding.get("title")).strip()
+        msg_core = rdesc
+        msg = f"[{sev_label}] {msg_core}" + (f" (issue_id={issue_id})" if issue_id else "")
 
-        rule_name = category or rule_id
-        message_text = as_str(get_first(item, "display_text", "message", "description", "issue_type")).strip()
-        if not message_text:
-            message_text = rule_name
+        raw_path, raw_line = extract_file_and_line(finding)
 
-        file_path = as_str(get_first(item, "file_path", "file", "filename", "source_file")).strip()
-        line_raw = get_first(item, "line", "line_number", "lineNumber")
-        line = safe_int(line_raw, default=1)
+        uri: str
+        start_line: int
 
-        if file_path:
-            uri = normalize_repo_path(file_path)
-            count_file_loc += 1
+        if raw_path:
+            resolved = resolve_repo_uri(repo_root, raw_path, DEFAULT_SOURCE_ROOTS)
+            if resolved and raw_line:
+                uri = resolved
+                start_line = int(raw_line)
+                results_with_file += 1
+            else:
+                uri = placeholder_uri
+                start_line = stable_placeholder_line(rid, msg)
+                results_with_placeholder += 1
         else:
             uri = placeholder_uri
-            line = stable_placeholder_line(rule_id, message_text)
-            count_placeholder_loc += 1
+            start_line = stable_placeholder_line(rid, msg)
+            results_with_placeholder += 1
 
-        # Define rule once with GitHub security severity metadata
-        if rule_id not in rules:
-            rules[rule_id] = {
-                "id": rule_id,
-                "name": rule_name,
-                "shortDescription": {"text": rule_name},
-                "fullDescription": {"text": message_text},
-                "help": {"text": f"{rule_name}\nSeverity: {sev_label}\nRule: {rule_id}"},
+        if rid not in rules:
+            rules[rid] = {
+                "id": rid,
+                "name": rname,
+                "shortDescription": {"text": rname},
+                "fullDescription": {"text": rdesc},
+                "help": {"text": f"{rname}\nSeverity: {sev_label}\nRule: {rid}"},
                 "properties": {
-                    # Important: tag as security + provide security-severity score.  [oai_citation:6‡GitHub Docs](https://docs.github.com/en/enterprise-cloud%40latest/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning?utm_source=chatgpt.com)
                     "tags": ["security", "veracode", "pipeline-scan"],
                     "security-severity": gh_sec_score,
-                    "precision": "high",
                     "veracode-severity": sev_label,
-                    "cwe": cwe_str,
+                    "cwe": as_str(finding.get("cwe_id")).strip(),
                 },
             }
 
-        # Also prefix message with Veracode severity so it’s visible in titles.
-        titled_msg = f"[{sev_label}] {message_text}"
-
         results.append({
-            "ruleId": rule_id,
-            "level": sarif_level,  # used by GitHub filters  [oai_citation:7‡GitHub Docs](https://docs.github.com/en/enterprise-cloud%40latest/code-security/code-scanning/integrating-with-code-scanning/sarif-support-for-code-scanning?utm_source=chatgpt.com)
-            "message": {"text": titled_msg},
-            "locations": [
-                {
-                    "physicalLocation": {
-                        "artifactLocation": {"uri": uri},
-                        "region": {"startLine": line},
-                    }
+            "ruleId": rid,
+            "level": sarif_level,
+            "message": {"text": msg},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": uri},
+                    "region": {"startLine": start_line},
                 }
-            ],
+            }],
             "properties": {
-                "veracode-severity": sev_label,
+                "issue_id": issue_id,
+                "veracode_severity": sev_label,
                 "isPlaceholderLocation": (uri == placeholder_uri),
+                "raw_path": as_str(raw_path),
+                "raw_line": as_str(raw_line),
+                "title": title,
             },
         })
 
     sarif: Dict[str, Any] = {
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        "name": args.tool_name,
-                        **({"version": args.tool_version} if args.tool_version else {}),
-                        "rules": list(rules.values()),
-                    }
-                },
-                "results": results,
-            }
-        ],
+        "runs": [{
+            "tool": {"driver": {
+                "name": args.tool_name,
+                **({"version": args.tool_version} if args.tool_version else {}),
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
     }
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(sarif, f, indent=2, ensure_ascii=False)
 
     stats = {
-        "findings_total_in_json": count_total,
+        "findings_total_in_json": total,
         "sarif_results_written": len(results),
         "sarif_rules_written": len(rules),
-        "results_with_file_location": count_file_loc,
-        "results_with_placeholder_location": count_placeholder_loc,
+        "results_with_file_location": results_with_file,
+        "results_with_placeholder_location": results_with_placeholder,
         "placeholder_uri": placeholder_uri,
+        "repo_root": repo_root,
+        "source_roots_tried": DEFAULT_SOURCE_ROOTS,
     }
     with open(args.output_stats, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote SARIF: {args.output} (results={len(results)}, rules={len(rules)})")
-    print(f"Wrote stats: {args.output_stats} -> {stats}")
+    print(f"Wrote SARIF: {args.output}")
+    print(json.dumps(stats, indent=2))
 
 if __name__ == "__main__":
     main()
