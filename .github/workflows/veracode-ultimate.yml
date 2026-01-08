@@ -1,4 +1,4 @@
-name: Veracode Ultimate (Pipeline Scan + SARIF + Fix Universal)
+name: Veracode Ultimate (Pipeline Scan + SARIF + Batch Fix)
 
 on:
   workflow_dispatch:
@@ -120,43 +120,127 @@ jobs:
       matrix: ${{ steps.mk.outputs.matrix }}
 
     steps:
+      - name: Download scan outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: veracode-pipeline-scan
+          path: pipeline_out
+
       - name: Setup Python (matrix builder)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Build Fix matrix (single-line JSON output)
+      - name: Build Fix matrix dynamically from findings (only batch-fixable)
         id: mk
         run: |
           python - << 'PY'
           import json, os
+          from collections import Counter
 
-          # Languages supported by Fix GitHub Action: java,csharp,javascript,python,kotlin,scala,php,go
-          # CWEs below are intended for batch-mode usage.
-          matrix = {
-            "include": [
-              {"language":"java","cwe":"80,89,113,117,159,209,331,404,597,611","sbp1":"com/:src/main/java/com/","sbp2":"WEB-INF:src/main/webapp/WEB-INF","sbp3":""},
-              {"language":"kotlin","cwe":"80,89,113,117,331,404","sbp1":"com/:src/main/java/com/","sbp2":"","sbp3":""},
-              {"language":"scala","cwe":"78,80,117,611","sbp1":"com/:src/main/java/com/","sbp2":"","sbp3":""},
-              {"language":"csharp","cwe":"80,89,117,209,316,331,352,404,611","sbp1":"src/:src/","sbp2":"","sbp3":""},
-              {"language":"javascript","cwe":"80,89,113,117,209,352,601,611,614","sbp1":"src/:src/","sbp2":"","sbp3":""},
-              {"language":"python","cwe":"78,80,89,295,331,757","sbp1":"src/:src/","sbp2":"app/:app/","sbp3":""},
-              {"language":"php","cwe":"80,89,117","sbp1":"src/:src/","sbp2":"","sbp3":""},
-              {"language":"go","cwe":"73,78,117","sbp1":"src/:src/","sbp2":"","sbp3":""}
-            ]
+          # Batch-fix CWE allow lists (batch-supported by language)
+          ALLOW = {
+            "java":       {"80","89","113","117","159","209","331","404","597","611"},
+            "kotlin":     {"80","89","113","117","331","404"},
+            "scala":      {"78","80","117","611"},
+            "csharp":     {"80","89","117","209","316","331","352","404","611"},
+            "javascript": {"80","89","113","117","209","352","601","611","614"},
+            "python":     {"78","80","89","295","331","757"},
+            "php":        {"80","89","117"},
+            "go":         {"73","78","117"},
           }
 
-          matrix_str = json.dumps(matrix, separators=(",", ":"))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-            f.write(f"matrix={matrix_str}\n")
+          EXT_TO_LANG = {
+            ".java":"java", ".jsp":"java",
+            ".kt":"kotlin",
+            ".scala":"scala",
+            ".cs":"csharp",
+            ".js":"javascript", ".ts":"javascript", ".jsx":"javascript", ".tsx":"javascript",
+            ".py":"python",
+            ".php":"php",
+            ".go":"go",
+          }
 
-          print("Matrix output written.")
+          def norm(p: str) -> str:
+            return (p or "").replace("\\","/").strip()
+
+          def src_path(f: dict) -> str:
+            src = ((f.get("files") or {}).get("source_file") or {})
+            return norm(src.get("file") or src.get("upload_file") or "")
+
+          data = json.load(open("pipeline_out/filtered_results.json","r",encoding="utf-8"))
+          findings = data.get("findings", []) if isinstance(data, dict) else []
+
+          # Determine which languages have at least one batch-fixable CWE in the findings
+          lang_has_fixable = {k: False for k in ALLOW.keys()}
+
+          # For better JS path mapping: count top-level dirs among JS findings
+          js_root_counts = Counter()
+
+          for f in findings:
+            if not isinstance(f, dict):
+              continue
+            p = src_path(f).lower()
+            lang = None
+            for ext, l in EXT_TO_LANG.items():
+              if p.endswith(ext):
+                lang = l
+                break
+            if not lang:
+              continue
+            cwe = str(f.get("cwe_id") or "").strip()
+            if cwe and cwe in ALLOW.get(lang, set()):
+              lang_has_fixable[lang] = True
+
+            if lang == "javascript":
+              parts = p.split("/")
+              if parts and parts[0]:
+                js_root_counts[parts[0]] += 1
+
+          def pick_js_root():
+            # Prefer common roots if present, else most common top-level folder
+            preferred = ["src","routes","frontend","lib","app","server","client","packages"]
+            for d in preferred:
+              if js_root_counts.get(d, 0) > 0 and os.path.isdir(d):
+                return d
+            if js_root_counts:
+              top = js_root_counts.most_common(1)[0][0]
+              return top if os.path.isdir(top) else "src"
+            return "src"
+
+          js_root = pick_js_root()
+
+          BASE = {
+            "java":       ("com/:src/main/java/com/","WEB-INF:src/main/webapp/WEB-INF",""),
+            "kotlin":     ("com/:src/main/java/com/","",""),
+            "scala":      ("com/:src/main/java/com/","",""),
+            "csharp":     ("src/:src/","",""),
+            "javascript": (f"{js_root}/:{js_root}/","",""),
+            "python":     ("src/:src/","app/:app/",""),
+            "php":        ("src/:src/","",""),
+            "go":         ("src/:src/","",""),
+          }
+
+          include = []
+          for lang, ok in lang_has_fixable.items():
+            if not ok:
+              continue
+            sbp1, sbp2, sbp3 = BASE[lang]
+            cwe_list = ",".join(sorted(ALLOW[lang], key=lambda x: int(x)))
+            include.append({"language": lang, "cwe": cwe_list, "sbp1": sbp1, "sbp2": sbp2, "sbp3": sbp3})
+
+          matrix = {"include": include}
+          matrix_str = json.dumps(matrix, separators=(",", ":"))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"matrix={matrix_str}\n")
+
+          print("Batch-fix languages to run:", [x["language"] for x in include])
           PY
-        shell: bash
 
   veracode_fix_universal:
     needs: [pipeline_scan_and_sarif, build_fix_matrix]
-    if: (github.event_name == 'pull_request' || inputs.run_fix == 'true') && needs.build_fix_matrix.outputs.matrix != ''
+    if: (github.event_name == 'pull_request' || inputs.run_fix == 'true') && needs.build_fix_matrix.outputs.matrix != '' && needs.build_fix_matrix.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -179,7 +263,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Filter Fix input to language=${{ matrix.language }}
+      - name: Filter Fix input to language=${{ matrix.language }} and allowed CWEs only
         id: filter
         run: |
           set -euo pipefail
@@ -187,6 +271,7 @@ jobs:
           import json, os
 
           lang = os.environ["LANG"]
+          allow = set(os.environ["ALLOW_CWES"].split(",")) if os.environ.get("ALLOW_CWES") else set()
           inp = "pipeline_out/filtered_results.json"
           outp = f"pipeline_out/filtered_results_{lang}.json"
 
@@ -205,22 +290,25 @@ jobs:
           if not exts:
             raise SystemExit(f"No ext mapping for {lang}")
 
-          def norm(p):
-            return (p or "").replace("\\","/").strip()
-
+          def norm(p): return (p or "").replace("\\","/").strip()
           def src_path(f):
             src = ((f.get("files") or {}).get("source_file") or {})
             return norm(src.get("file") or src.get("upload_file") or "")
 
           data = json.load(open(inp, "r", encoding="utf-8"))
           findings = data.get("findings", []) if isinstance(data, dict) else []
+
           kept = []
           for f in findings:
             if not isinstance(f, dict):
               continue
             p = src_path(f).lower()
-            if any(p.endswith(e) for e in exts):
-              kept.append(f)
+            if not any(p.endswith(e) for e in exts):
+              continue
+            cwe = str(f.get("cwe_id") or "").strip()
+            if allow and cwe not in allow:
+              continue
+            kept.append(f)
 
           data2 = dict(data)
           data2["findings"] = kept
@@ -230,15 +318,16 @@ jobs:
             g.write(f"count={len(kept)}\n")
             g.write(f"file={outp}\n")
 
-          print(f"Filtered for {lang}: {len(kept)} of {len(findings)} findings")
+          print(f"Filtered for {lang} (allowed CWEs only): {len(kept)}")
           PY
         env:
           LANG: ${{ matrix.language }}
+          ALLOW_CWES: ${{ matrix.cwe }}
 
-      - name: Skip Fix when no findings for this language
+      - name: Skip Fix when no batch-fixable findings for this language
         if: steps.filter.outputs.count == '0'
         run: |
-          echo "No findings for language=${{ matrix.language }}. Skipping Fix."
+          echo "No batch-fixable findings for language=${{ matrix.language }}. Skipping Fix."
 
       - name: Run Veracode Fix (Batch → PR) — language=${{ matrix.language }}
         if: steps.filter.outputs.count != '0'
