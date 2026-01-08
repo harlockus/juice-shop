@@ -1,0 +1,231 @@
+name: Veracode Fix — Single Advisor (PR Comments + Annotations)
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  pipeline_scan_for_single:
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'veracode-single-fix-holder-')
+    runs-on: ubuntu-latest
+    outputs:
+      has_results: ${{ steps.scan_outputs.outputs.has_results }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create source zip (exclude node_modules)
+        run: |
+          zip -r pipeline-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+
+      - name: Set up Java (Pipeline Scan tool)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download Pipeline Scan tool
+        run: |
+          curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -o pipeline-scan-LATEST.zip
+
+      - name: Run Pipeline Scan (ESD enabled, do not fail job on findings)
+        id: scan_outputs
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          set +e
+          java -jar pipeline-scan.jar \
+            -vid "${VERACODE_API_ID}" \
+            -vkey "${VERACODE_API_KEY}" \
+            -f "pipeline-src.zip" \
+            -esd true \
+            -jf "results.json" \
+            -fjf "filtered_results.json"
+          RC=$?
+          set -e
+
+          echo "Pipeline Scan exit code: $RC"
+          ls -lah results.json filtered_results.json || true
+
+          if [ -f results.json ] && [ -f filtered_results.json ]; then
+            echo "has_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            echo "ERROR: Pipeline Scan did not produce results.json / filtered_results.json"
+            exit 1
+          fi
+
+      - name: Upload scan outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-single-scan
+          path: |
+            results.json
+            filtered_results.json
+
+  single_fix_matrix:
+    needs: pipeline_scan_for_single
+    if: needs.pipeline_scan_for_single.outputs.has_results == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # Single-fix CWE lists per language from "About Veracode Fix" tables  [oai_citation:3‡Veracode Docs](https://docs.veracode.com/r/About_Veracode_Fix)
+          - language: java
+            cwe: "80,89,113,117,159,209,327,331,404,502,597,601,611"
+            sbp1: "com/:src/main/java/com/"
+            sbp2: "WEB-INF:src/main/webapp/WEB-INF"
+            sbp3: ""
+
+          - language: csharp
+            cwe: "73,80,89,117,209,316,327,331,352,404,601,611"
+            sbp1: "src/:src/"
+            sbp2: ""
+            sbp3: ""
+
+          - language: javascript
+            cwe: "73,78,80,89,113,117,209,311,312,327,352,601,611,614"
+            sbp1: "routes/:routes/"
+            sbp2: "src/:src/"
+            sbp3: "frontend/:frontend/"
+
+          - language: python
+            cwe: "73,78,80,89,295,327,331,601,757"
+            sbp1: "src/:src/"
+            sbp2: "app/:app/"
+            sbp3: ""
+
+          - language: kotlin
+            cwe: "80,89,113,117,331,404"
+            sbp1: "com/:src/main/java/com/"
+            sbp2: ""
+            sbp3: ""
+
+          - language: scala
+            cwe: "78,80,117,611"
+            sbp1: "com/:src/main/java/com/"
+            sbp2: ""
+            sbp3: ""
+
+          - language: php
+            cwe: "73,80,89,117"
+            sbp1: "src/:src/"
+            sbp2: ""
+            sbp3: ""
+
+          - language: go
+            cwe: "73,78,117"
+            sbp1: "src/:src/"
+            sbp2: ""
+            sbp3: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download scan outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: veracode-single-scan
+          path: scan_out
+
+      - name: Setup Python (filter per language)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Filter scan results to language=${{ matrix.language }}
+        id: filter
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import json, os
+
+          lang = os.environ["LANG"]
+          inp = "scan_out/filtered_results.json"
+          outp = f"scan_out/filtered_results_{lang}.json"
+
+          LANG_EXTS = {
+            "java": [".java", ".jsp"],
+            "kotlin": [".kt"],
+            "scala": [".scala"],
+            "csharp": [".cs"],
+            "javascript": [".js", ".ts", ".jsx", ".tsx"],
+            "python": [".py"],
+            "php": [".php"],
+            "go": [".go"],
+          }
+
+          exts = LANG_EXTS.get(lang, [])
+          if not exts:
+            raise SystemExit(f"No ext mapping for {lang}")
+
+          def norm(p): return (p or "").replace("\\","/").strip()
+          def src_path(f):
+            src = ((f.get("files") or {}).get("source_file") or {})
+            return norm(src.get("file") or src.get("upload_file") or "")
+
+          data = json.load(open(inp, "r", encoding="utf-8"))
+          findings = data.get("findings", []) if isinstance(data, dict) else []
+          kept = []
+          for f in findings:
+            if not isinstance(f, dict): 
+              continue
+            p = src_path(f).lower()
+            if any(p.endswith(e) for e in exts):
+              kept.append(f)
+
+          data2 = dict(data)
+          data2["findings"] = kept
+          json.dump(data2, open(outp, "w", encoding="utf-8"), indent=2)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as g:
+            g.write(f"count={len(kept)}\n")
+            g.write(f"file={outp}\n")
+
+          print(f"Filtered for {lang}: {len(kept)} of {len(findings)} findings")
+          PY
+        env:
+          LANG: ${{ matrix.language }}
+
+      - name: Skip single fix when no findings for this language
+        if: steps.filter.outputs.count == '0'
+        run: echo "No findings for language=${{ matrix.language }}. Skipping."
+
+      - name: Run Veracode Fix (single) — language=${{ matrix.language }}
+        if: steps.filter.outputs.count != '0'
+        continue-on-error: true
+        uses: Veracode/veracode-fix@v1.0.4
+        with:
+          vid: ${{ secrets.VID }}
+          vkey: ${{ secrets.VKEY }}
+          inputFile: ${{ steps.filter.outputs.file }}
+          language: ${{ matrix.language }}
+          cwe: ${{ matrix.cwe }}
+          fixType: single
+          files: all
+
+          # In PR context, this posts one comment per flaw (can be a lot).  [oai_citation:4‡Veracode Docs](https://docs.veracode.com/r/Veracode_Fix_GitHub_Action?utm_source=chatgpt.com)
+          prComment: true
+
+          # Single fix cannot create PR (batch-only).  [oai_citation:5‡Veracode Docs](https://docs.veracode.com/r/Veracode_Fix_GitHub_Action?utm_source=chatgpt.com)
+          createPR: false
+
+          # Rewrite paths (only 1..3 supported).  [oai_citation:6‡Veracode Docs](https://docs.veracode.com/r/Veracode_Fix_GitHub_Action?utm_source=chatgpt.com)
+          source_base_path_1: ${{ matrix.sbp1 }}
+          source_base_path_2: ${{ matrix.sbp2 }}
+          source_base_path_3: ${{ matrix.sbp3 }}
