@@ -1,0 +1,65 @@
+name: Veracode Fix — Single Helper (Create PR to Hold Comments)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch to target"
+        required: true
+        default: "main"
+      pr_title:
+        description: "Title for the holder PR"
+        required: true
+        default: "Veracode Fix — Single Advisor Holder PR"
+      pr_body:
+        description: "Body for the holder PR"
+        required: true
+        default: "This PR exists to trigger Veracode Fix (single) suggestions as PR comments/annotations."
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  create_holder_pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base_branch }}
+
+      - name: Configure git
+        run: |
+          git config user.name "veracode-fix-bot"
+          git config user.email "veracode-fix-bot@users.noreply.github.com"
+
+      - name: Create holder branch + commit
+        run: |
+          set -euo pipefail
+          TS="$(date +%s)"
+          BR="veracode-single-fix-holder-${TS}"
+          echo "BRANCH=$BR" >> $GITHUB_ENV
+
+          git checkout -b "$BR"
+
+          mkdir -p .veracode
+          cat > .veracode/SINGLE_FIX_HOLDER.md << 'EOF'
+          # Veracode Fix Single Advisor Holder
+          This file exists to create a PR that triggers the Veracode Fix single advisor workflow.
+          EOF
+
+          git add .veracode/SINGLE_FIX_HOLDER.md
+          git commit -m "chore: create holder PR for Veracode Fix single advisor"
+          git push origin "$BR"
+
+      - name: Create PR (this triggers the single advisor workflow)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base "${{ inputs.base_branch }}" \
+            --head "${BRANCH}" \
+            --title "${{ inputs.pr_title }}" \
+            --body "${{ inputs.pr_body }}"
