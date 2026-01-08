@@ -1,7 +1,12 @@
-name: Veracode Ultimate (Pipeline Scan + SARIF + Fix Auto-Detect)
+name: Veracode Ultimate (Pipeline Scan + SARIF + Fix Universal)
 
 on:
   workflow_dispatch:
+    inputs:
+      run_fix:
+        description: "Run Veracode Fix (batch PR) after scan"
+        required: true
+        default: "true"
   pull_request:
     branches: [ main, master ]
 
@@ -13,6 +18,7 @@ permissions:
 
 jobs:
   pipeline_scan_and_sarif:
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'veracode-single-fix-holder-')
     runs-on: ubuntu-latest
     outputs:
       has_results: ${{ steps.scan_outputs.outputs.has_results }}
@@ -44,7 +50,7 @@ jobs:
           curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip
 
-      - name: Run Pipeline Scan (do not fail job on findings)
+      - name: Run Pipeline Scan (ESD enabled, do not fail job on findings)
         id: scan_outputs
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
@@ -106,155 +112,148 @@ jobs:
             veracode-pipeline-sarif-stats.json
             .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md
 
-  detect_fix_languages:
+  build_fix_matrix:
     needs: pipeline_scan_and_sarif
     if: needs.pipeline_scan_and_sarif.outputs.has_results == 'true'
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.detector.outputs.matrix }}
+      matrix: ${{ steps.mk.outputs.matrix }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Setup Python (matrix builder)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Detect Fix languages (repo-based, no broken pipes)
-        id: detector
+      - name: Build Fix matrix (single-line JSON output)
+        id: mk
         run: |
-          set -euo pipefail
+          python - << 'PY'
+          import json, os
 
-          found=()
-
-          add_lang () {
-            local lang="$1"
-            for x in "${found[@]:-}"; do
-              if [ "$x" = "$lang" ]; then
-                return 0
-              fi
-            done
-            found+=("$lang")
+          # Languages supported by Fix GitHub Action: java,csharp,javascript,python,kotlin,scala,php,go
+          # CWEs below are intended for batch-mode usage.
+          matrix = {
+            "include": [
+              {"language":"java","cwe":"80,89,113,117,159,209,331,404,597,611","sbp1":"com/:src/main/java/com/","sbp2":"WEB-INF:src/main/webapp/WEB-INF","sbp3":""},
+              {"language":"kotlin","cwe":"80,89,113,117,331,404","sbp1":"com/:src/main/java/com/","sbp2":"","sbp3":""},
+              {"language":"scala","cwe":"78,80,117,611","sbp1":"com/:src/main/java/com/","sbp2":"","sbp3":""},
+              {"language":"csharp","cwe":"80,89,117,209,316,331,352,404,611","sbp1":"src/:src/","sbp2":"","sbp3":""},
+              {"language":"javascript","cwe":"80,89,113,117,209,352,601,611,614","sbp1":"src/:src/","sbp2":"","sbp3":""},
+              {"language":"python","cwe":"78,80,89,295,331,757","sbp1":"src/:src/","sbp2":"app/:app/","sbp3":""},
+              {"language":"php","cwe":"80,89,117","sbp1":"src/:src/","sbp2":"","sbp3":""},
+              {"language":"go","cwe":"73,78,117","sbp1":"src/:src/","sbp2":"","sbp3":""}
+            ]
           }
 
-          # Java
-          if find . -type f -name "*.java" -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "java"
-          fi
+          matrix_str = json.dumps(matrix, separators=(",", ":"))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"matrix={matrix_str}\n")
 
-          # C#
-          if find . -type f \( -name "*.cs" -o -name "*.csproj" -o -name "*.sln" \) -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "csharp"
-          fi
+          print("Matrix output written.")
+          PY
+        shell: bash
 
-          # JavaScript / TypeScript
-          if find . -type f \( -name "*.js" -o -name "*.ts" -o -name "package.json" \) -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "javascript"
-          fi
-
-          # Python
-          if find . -type f \( -name "*.py" -o -name "requirements.txt" -o -name "pyproject.toml" \) -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "python"
-          fi
-
-          # Kotlin
-          if find . -type f -name "*.kt" -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "kotlin"
-          fi
-
-          # Scala
-          if find . -type f -name "*.scala" -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "scala"
-          fi
-
-          # PHP
-          if find . -type f \( -name "*.php" -o -name "composer.json" \) -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "php"
-          fi
-
-          # Go
-          if find . -type f \( -name "*.go" -o -name "go.mod" \) -not -path "./.git/*" -print -quit | grep -q .; then
-            add_lang "go"
-          fi
-
-          if [ ${#found[@]} -eq 0 ]; then
-            echo "No Fix-supported languages detected. Skipping Fix."
-            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          json='{"include":['
-          first=1
-          for lang in "${found[@]}"; do
-            if [ $first -eq 0 ]; then json+=','; fi
-            first=0
-            json+='{"language":"'"$lang"'"}'
-          done
-          json+=']}'
-
-          echo "Detected Fix languages: ${found[*]}"
-          echo "matrix=$json" >> "$GITHUB_OUTPUT"
-
-  veracode_fix_detected:
-    needs: [pipeline_scan_and_sarif, detect_fix_languages]
-    if: needs.detect_fix_languages.outputs.matrix != ''
+  veracode_fix_universal:
+    needs: [pipeline_scan_and_sarif, build_fix_matrix]
+    if: (github.event_name == 'pull_request' || inputs.run_fix == 'true') && needs.build_fix_matrix.outputs.matrix != ''
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect_fix_languages.outputs.matrix) }}
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.build_fix_matrix.outputs.matrix) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download pipeline results
+      - name: Download scan outputs
         uses: actions/download-artifact@v4
         with:
           name: veracode-pipeline-scan
           path: pipeline_out
 
-      - name: Verify Fix input exists
+      - name: Setup Python (Fix input filtering)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Filter Fix input to language=${{ matrix.language }}
+        id: filter
         run: |
           set -euo pipefail
-          test -f pipeline_out/filtered_results.json
+          python - << 'PY'
+          import json, os
 
-      # Choose ONE best root for JS/TS so we stay within Fix's 3 mapping limit.
-      - name: Detect best JS/TS root for Fix mapping
-        if: matrix.language == 'javascript'
+          lang = os.environ["LANG"]
+          inp = "pipeline_out/filtered_results.json"
+          outp = f"pipeline_out/filtered_results_{lang}.json"
+
+          LANG_EXTS = {
+            "java": [".java", ".jsp"],
+            "kotlin": [".kt"],
+            "scala": [".scala"],
+            "csharp": [".cs"],
+            "javascript": [".js", ".ts", ".jsx", ".tsx"],
+            "python": [".py"],
+            "php": [".php"],
+            "go": [".go"],
+          }
+
+          exts = LANG_EXTS.get(lang, [])
+          if not exts:
+            raise SystemExit(f"No ext mapping for {lang}")
+
+          def norm(p):
+            return (p or "").replace("\\","/").strip()
+
+          def src_path(f):
+            src = ((f.get("files") or {}).get("source_file") or {})
+            return norm(src.get("file") or src.get("upload_file") or "")
+
+          data = json.load(open(inp, "r", encoding="utf-8"))
+          findings = data.get("findings", []) if isinstance(data, dict) else []
+          kept = []
+          for f in findings:
+            if not isinstance(f, dict):
+              continue
+            p = src_path(f).lower()
+            if any(p.endswith(e) for e in exts):
+              kept.append(f)
+
+          data2 = dict(data)
+          data2["findings"] = kept
+          json.dump(data2, open(outp, "w", encoding="utf-8"), indent=2)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as g:
+            g.write(f"count={len(kept)}\n")
+            g.write(f"file={outp}\n")
+
+          print(f"Filtered for {lang}: {len(kept)} of {len(findings)} findings")
+          PY
+        env:
+          LANG: ${{ matrix.language }}
+
+      - name: Skip Fix when no findings for this language
+        if: steps.filter.outputs.count == '0'
         run: |
-          set -euo pipefail
-          pick=""
-          for d in src routes frontend lib app server client packages; do
-            if [ -d "$d" ]; then
-              pick="$d"
-              break
-            fi
-          done
+          echo "No findings for language=${{ matrix.language }}. Skipping Fix."
 
-          if [ -n "$pick" ]; then
-            echo "JS_ROOT=$pick" >> "$GITHUB_ENV"
-            echo "Detected JS_ROOT=$pick"
-          else
-            echo "JS_ROOT=" >> "$GITHUB_ENV"
-            echo "No common JS root folder found; defaulting to src/"
-          fi
-
-      - name: Run Veracode Fix (Batch PR) — language=${{ matrix.language }}
+      - name: Run Veracode Fix (Batch → PR) — language=${{ matrix.language }}
+        if: steps.filter.outputs.count != '0'
         continue-on-error: true
         uses: Veracode/veracode-fix@v1.0.4
         with:
           vid: ${{ secrets.VID }}
           vkey: ${{ secrets.VKEY }}
-          inputFile: pipeline_out/filtered_results.json
+          inputFile: ${{ steps.filter.outputs.file }}
           language: ${{ matrix.language }}
+          cwe: ${{ matrix.cwe }}
           fixType: batch
           files: all
           prComment: true
           createPR: true
-
-          # Mapping slot 1: Java package paths
-          source_base_path_1: "com/:src/main/java/com/"
-
-          # Mapping slot 2: Java webapp JSPs
-          source_base_path_2: "WEB-INF/:src/main/webapp/WEB-INF/"
-
-          # Mapping slot 3: dynamic for JS/TS repos (ONLY 1 slot available in Fix)
-          # If JS_ROOT is empty, we use src/:src/ as a safe default.
-          source_base_path_3: "${{ env.JS_ROOT && format('{0}/:{0}/', env.JS_ROOT) || 'src/:src/' }}"
+          source_base_path_1: ${{ matrix.sbp1 }}
+          source_base_path_2: ${{ matrix.sbp2 }}
+          source_base_path_3: ${{ matrix.sbp3 }}
