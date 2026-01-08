@@ -1,7 +1,12 @@
-name: Veracode Pipeline Scan (Ultimate: SARIF + Fix Input)
+name: Veracode Pipeline Scan (Ultimate SARIF for GitHub Code Scanning)
 
 on:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
 
 permissions:
   contents: read
@@ -17,9 +22,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Placeholder file for findings without file context (required for GitHub Code Scanning).
+      - name: Ensure placeholder file exists for global findings
+        run: |
+          mkdir -p .veracode
+          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
+          # Veracode Pipeline Scan – Global Findings Placeholder
+
+          Some Pipeline Scan findings are not associated with a specific file/line.
+          These findings are anchored to this file so GitHub Code Scanning can display them.
+          EOF
+
       - name: Create source zip (exclude node_modules)
         run: |
-          zip -r pipeline-src.zip . -x "**/node_modules/**" -x "**/.git/**"
+          zip -r pipeline-src.zip . \
+            -x "**/node_modules/**" \
+            -x "**/.git/**"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -27,54 +45,28 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Download Pipeline Scan tool
+      - name: Download Veracode Pipeline Scan tool
         run: |
           curl -sSLO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
           unzip -o pipeline-scan-LATEST.zip
 
-      - name: Run Pipeline Scan (do not fail job on findings)
+      - name: Run Veracode Pipeline Scan
+        continue-on-error: true
         env:
           VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
           VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
         run: |
-          set -euo pipefail
-
-          set +e
           java -jar pipeline-scan.jar \
-            -vid "${VERACODE_API_ID}" \
-            -vkey "${VERACODE_API_KEY}" \
-            -f "pipeline-src.zip" \
-            -jf "results.json" \
-            -fjf "filtered_results.json"
-          RC=$?
-          set -e
+            --veracode_api_id "$VERACODE_API_ID" \
+            --veracode_api_key "$VERACODE_API_KEY" \
+            --file "pipeline-src.zip" \
+            --json_output_file "results.json" \
+            --filtered_json_output_file "filtered_results.json"
 
-          echo "Pipeline Scan exit code: $RC"
-          ls -lah results.json filtered_results.json || true
-
-          # Only fail if no outputs were produced (real failure)
-          if [ ! -f results.json ] || [ ! -f filtered_results.json ]; then
-            echo "ERROR: Pipeline Scan did not produce results.json / filtered_results.json"
-            exit 1
-          fi
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Ensure placeholder file exists (Pipeline SARIF)
-        run: |
-          mkdir -p .veracode
-          cat > .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md << 'EOF'
-          # Veracode Pipeline Scan – Global Findings Placeholder
-          Findings without a resolvable repo file+line are anchored here.
-          EOF
-
-      - name: Convert Pipeline JSON -> SARIF (real file+line where possible)
+      - name: Convert Pipeline Scan results to SARIF (capture 100% of findings)
         run: |
           python scripts/pipeline_results_to_sarif.py \
-            --input filtered_results.json \
+            --input results.json \
             --output veracode-pipeline.sarif \
             --placeholder-uri .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md \
             --output-stats veracode-pipeline-sarif-stats.json
@@ -86,11 +78,11 @@ jobs:
           category: veracode-pipeline
           wait-for-processing: true
 
-      - name: Upload artifacts (always)
+      - name: Upload Pipeline Scan outputs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: veracode-pipeline-scan
+          name: veracode-pipeline-scan-results
           path: |
             results.json
             filtered_results.json
