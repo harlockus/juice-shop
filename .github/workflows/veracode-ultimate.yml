@@ -58,6 +58,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Pipeline scan exits non-zero when findings exist; capture but don't fail.
           set +e
           java -jar pipeline-scan.jar \
             -vid "${VERACODE_API_ID}" \
@@ -80,7 +81,7 @@ jobs:
             exit 1
           fi
 
-      - name: Setup Python (SARIF conversion)
+      - name: Setup Python (SARIF + telemetry)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -100,7 +101,83 @@ jobs:
           category: veracode-pipeline
           wait-for-processing: true
 
-      - name: Upload pipeline artifacts
+      - name: Telemetry — summarize pipeline findings (baseline + fixable-by-language)
+        run: |
+          python - << 'PY'
+          import json
+          from collections import Counter, defaultdict
+
+          ALLOW = {
+            "java":       {"80","89","113","117","159","209","331","404","597","611"},
+            "kotlin":     {"80","89","113","117","331","404"},
+            "scala":      {"78","80","117","611"},
+            "csharp":     {"80","89","117","209","316","331","352","404","611"},
+            "javascript": {"80","89","113","117","209","352","601","611","614"},
+            "python":     {"78","80","89","295","331","757"},
+            "php":        {"80","89","117"},
+            "go":         {"73","78","117"},
+          }
+
+          EXT_TO_LANG = {
+            ".java":"java", ".jsp":"java",
+            ".kt":"kotlin",
+            ".scala":"scala",
+            ".cs":"csharp",
+            ".js":"javascript", ".ts":"javascript", ".jsx":"javascript", ".tsx":"javascript",
+            ".py":"python",
+            ".php":"php",
+            ".go":"go",
+          }
+
+          def norm(p): return (p or "").replace("\\","/").strip()
+
+          def src_path(f):
+            src = ((f.get("files") or {}).get("source_file") or {})
+            return norm(src.get("file") or src.get("upload_file") or "")
+
+          data = json.load(open("filtered_results.json","r",encoding="utf-8"))
+          findings = data.get("findings", []) if isinstance(data, dict) else []
+
+          total = len(findings)
+          sev = Counter()
+          cwe = Counter()
+          ext = Counter()
+          fixable_by_lang = Counter()
+
+          for f in findings:
+            if not isinstance(f, dict):
+              continue
+            sev[str(f.get("severity","UNKNOWN"))] += 1
+            cid = str(f.get("cwe_id") or "").strip()
+            if cid:
+              cwe[cid] += 1
+
+            p = src_path(f).lower()
+            lang = None
+            for e,l in EXT_TO_LANG.items():
+              if p.endswith(e):
+                lang = l
+                ext[e] += 1
+                break
+
+            if lang and cid and cid in ALLOW.get(lang,set()):
+              fixable_by_lang[lang] += 1
+
+          out = {
+            "total_findings": total,
+            "severity_counts": dict(sev),
+            "top_cwes": dict(cwe.most_common(15)),
+            "file_extension_counts": dict(ext),
+            "batch_fixable_findings_by_language": dict(fixable_by_lang),
+          }
+
+          with open("veracode_telemetry_pipeline.json","w",encoding="utf-8") as fp:
+            json.dump(out, fp, indent=2)
+
+          print(json.dumps(out, indent=2))
+          PY
+
+      - name: Upload pipeline artifacts + telemetry
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -110,6 +187,7 @@ jobs:
             filtered_results.json
             veracode-pipeline.sarif
             veracode-pipeline-sarif-stats.json
+            veracode_telemetry_pipeline.json
             .veracode/PIPELINE_SCAN_GLOBAL_FINDINGS.md
 
   build_fix_matrix:
@@ -138,7 +216,7 @@ jobs:
           import json, os
           from collections import Counter
 
-          # Batch-fix CWE allow lists (batch-supported by language)
+          # Batch-fix CWE allow lists per language (these define "all covered flaws" for batch)
           ALLOW = {
             "java":       {"80","89","113","117","159","209","331","404","597","611"},
             "kotlin":     {"80","89","113","117","331","404"},
@@ -161,6 +239,9 @@ jobs:
             ".go":"go",
           }
 
+          # Ignore roots that often appear in build artifacts or tooling outputs
+          IGNORE_ROOTS = {"target","dist","build","out",".veracode",".github","node_modules"}
+
           def norm(p: str) -> str:
             return (p or "").replace("\\","/").strip()
 
@@ -171,10 +252,7 @@ jobs:
           data = json.load(open("pipeline_out/filtered_results.json","r",encoding="utf-8"))
           findings = data.get("findings", []) if isinstance(data, dict) else []
 
-          # Determine which languages have at least one batch-fixable CWE in the findings
-          lang_has_fixable = {k: False for k in ALLOW.keys()}
-
-          # For better JS path mapping: count top-level dirs among JS findings
+          lang_fixable_counts = Counter()
           js_root_counts = Counter()
 
           for f in findings:
@@ -188,24 +266,20 @@ jobs:
                 break
             if not lang:
               continue
-            cwe = str(f.get("cwe_id") or "").strip()
-            if cwe and cwe in ALLOW.get(lang, set()):
-              lang_has_fixable[lang] = True
 
+            cid = str(f.get("cwe_id") or "").strip()
+            if cid and cid in ALLOW.get(lang, set()):
+              lang_fixable_counts[lang] += 1
+
+            # For JS mapping, use the findings as the source of truth (not repo dirs)
             if lang == "javascript":
               parts = p.split("/")
-              if parts and parts[0]:
+              if parts and parts[0] and parts[0] not in IGNORE_ROOTS:
                 js_root_counts[parts[0]] += 1
 
           def pick_js_root():
-            # Prefer common roots if present, else most common top-level folder
-            preferred = ["src","routes","frontend","lib","app","server","client","packages"]
-            for d in preferred:
-              if js_root_counts.get(d, 0) > 0 and os.path.isdir(d):
-                return d
             if js_root_counts:
-              top = js_root_counts.most_common(1)[0][0]
-              return top if os.path.isdir(top) else "src"
+              return js_root_counts.most_common(1)[0][0]
             return "src"
 
           js_root = pick_js_root()
@@ -222,12 +296,14 @@ jobs:
           }
 
           include = []
-          for lang, ok in lang_has_fixable.items():
-            if not ok:
+          for lang, count in lang_fixable_counts.items():
+            if count <= 0:
               continue
             sbp1, sbp2, sbp3 = BASE[lang]
             cwe_list = ",".join(sorted(ALLOW[lang], key=lambda x: int(x)))
             include.append({"language": lang, "cwe": cwe_list, "sbp1": sbp1, "sbp2": sbp2, "sbp3": sbp3})
+
+          include = sorted(include, key=lambda x: x["language"])
 
           matrix = {"include": include}
           matrix_str = json.dumps(matrix, separators=(",", ":"))
@@ -235,8 +311,22 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
             out.write(f"matrix={matrix_str}\n")
 
-          print("Batch-fix languages to run:", [x["language"] for x in include])
+          # Also emit a small telemetry file for visibility
+          telem = {
+            "batch_fixable_counts_by_language": dict(lang_fixable_counts),
+            "javascript_root_from_findings": js_root,
+            "matrix_languages": [x["language"] for x in include]
+          }
+          json.dump(telem, open("veracode_telemetry_fix_matrix.json","w",encoding="utf-8"), indent=2)
+          print(json.dumps(telem, indent=2))
           PY
+
+      - name: Upload Fix-matrix telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-fix-matrix-telemetry
+          path: veracode_telemetry_fix_matrix.json
 
   veracode_fix_universal:
     needs: [pipeline_scan_and_sarif, build_fix_matrix]
@@ -258,7 +348,7 @@ jobs:
           name: veracode-pipeline-scan
           path: pipeline_out
 
-      - name: Setup Python (Fix input filtering)
+      - name: Setup Python (Fix input filtering + telemetry)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -314,15 +404,31 @@ jobs:
           data2["findings"] = kept
           json.dump(data2, open(outp, "w", encoding="utf-8"), indent=2)
 
+          # step outputs
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as g:
             g.write(f"count={len(kept)}\n")
             g.write(f"file={outp}\n")
+
+          # per-language telemetry file
+          t = {
+            "language": lang,
+            "allowed_cwes": sorted(list(allow), key=lambda x: int(x)),
+            "batch_fixable_findings_in_input": len(kept),
+          }
+          json.dump(t, open(f"veracode_telemetry_fix_input_{lang}.json","w",encoding="utf-8"), indent=2)
 
           print(f"Filtered for {lang} (allowed CWEs only): {len(kept)}")
           PY
         env:
           LANG: ${{ matrix.language }}
           ALLOW_CWES: ${{ matrix.cwe }}
+
+      - name: Upload per-language Fix input telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veracode-fix-input-telemetry-${{ matrix.language }}
+          path: veracode_telemetry_fix_input_${{ matrix.language }}.json
 
       - name: Skip Fix when no batch-fixable findings for this language
         if: steps.filter.outputs.count == '0'
