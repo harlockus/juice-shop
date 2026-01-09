@@ -6,6 +6,7 @@ on:
 
 jobs:
   zap_scan:
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'veracode-single-fix-holder-')
     runs-on: ubuntu-latest
     name: Scan Juice Shop preview instance on Heroku
     steps:
