@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       base_branch:
-        description: "Base branch to target"
-        required: true
-        default: "main"
+        description: "Base branch to target (leave blank to auto-detect default branch)"
+        required: false
+        default: ""
       pr_title:
         description: "Title for the holder PR"
         required: true
@@ -24,10 +24,23 @@ jobs:
   create_holder_pr:
     runs-on: ubuntu-latest
     steps:
+      - name: Determine base branch (auto-detect)
+        id: base
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.base_branch }}" ]; then
+            BASE="${{ inputs.base_branch }}"
+          else
+            BASE="${{ github.event.repository.default_branch }}"
+          fi
+          echo "base_branch=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Using base branch: $BASE"
+
       - name: Checkout base branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.base_branch }}
+          ref: ${{ steps.base.outputs.base_branch }}
+          fetch-depth: 1
 
       - name: Configure git
         run: |
@@ -35,13 +48,15 @@ jobs:
           git config user.email "veracode-fix-bot@users.noreply.github.com"
 
       - name: Create holder branch + commit
+        env:
+          BASE_BRANCH: ${{ steps.base.outputs.base_branch }}
         run: |
           set -euo pipefail
           TS="$(date +%s)"
           BR="veracode-single-fix-holder-${TS}"
-          echo "BRANCH=$BR" >> $GITHUB_ENV
+          echo "BRANCH=$BR" >> "$GITHUB_ENV"
 
-          git checkout -b "$BR"
+          git checkout -b "$BR" "origin/${BASE_BRANCH}"
 
           mkdir -p .veracode
           cat > .veracode/SINGLE_FIX_HOLDER.md << 'EOF'
@@ -50,16 +65,35 @@ jobs:
           EOF
 
           git add .veracode/SINGLE_FIX_HOLDER.md
+
+          # Avoid failing if file already exists with same content (rare but possible)
+          if git diff --cached --quiet; then
+            echo "No changes detected; touching file to force a commit."
+            date >> .veracode/SINGLE_FIX_HOLDER.md
+            git add .veracode/SINGLE_FIX_HOLDER.md
+          fi
+
           git commit -m "chore: create holder PR for Veracode Fix single advisor"
           git push origin "$BR"
 
-      - name: Create PR (this triggers the single advisor workflow)
+      - name: Create PR (triggers the single advisor workflow)
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ steps.base.outputs.base_branch }}
         run: |
           set -euo pipefail
+
+          echo "Creating PR from branch: $BRANCH -> base: $BASE_BRANCH"
+
+          # If PR already exists for this branch, don't fail; print it.
+          if gh pr view "$BRANCH" >/dev/null 2>&1; then
+            echo "PR already exists for branch $BRANCH:"
+            gh pr view "$BRANCH" --json url,title,number --jq '.'
+            exit 0
+          fi
+
           gh pr create \
-            --base "${{ inputs.base_branch }}" \
-            --head "${BRANCH}" \
+            --base "$BASE_BRANCH" \
+            --head "$BRANCH" \
             --title "${{ inputs.pr_title }}" \
             --body "${{ inputs.pr_body }}"
