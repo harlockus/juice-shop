@@ -4,6 +4,7 @@ on: [push]
 
 jobs:
   LMLFTFY:
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'veracode-single-fix-holder-')
     runs-on: ubuntu-latest
     steps:
     - name: "Check out Git repository"
