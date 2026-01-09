@@ -31441,7 +31441,7 @@ THREE.AnimationHandler = ( function () {
 
 		if ( library[ name ] === undefined ) {
 
-			console.log( "THREE.AnimationHandler.add: Warning! " + name + " doesn't exists in library. Doing nothing." );
+console.log( "THREE.AnimationHandler.add: Warning! " + JSON.stringify(name) + " doesn't exists in library. Doing nothing." );
 
 		}
 
